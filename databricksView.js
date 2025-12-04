@@ -135,6 +135,11 @@ class DatabricksViewProvider {
                 icon: 'book',
             }),
             new SimpleTreeItem({
+                label: 'Get Notebook Source…',
+                command: { command: 'databricksTools.getNotebookSource', title: 'Get Notebook Source' },
+                icon: 'file-code',
+            }),
+            new SimpleTreeItem({
                 label: 'List Clusters',
                 command: { command: 'databricksTools.listClusters', title: 'List Clusters' },
                 icon: 'server',

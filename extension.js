@@ -464,6 +464,56 @@ function activate(context) {
             cts.dispose();
         }
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.getNotebookSource', async () => {
+        const input = await promptNotebookSourceInput();
+        if (!input) {
+            return;
+        }
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            const config = vscode.workspace.getConfiguration('databricksTools');
+            const apiVersion = config.get('jobsApiVersion', 'auto');
+            const rawMax = input.maxSourceChars;
+            const maxSourceChars = typeof rawMax === 'number' && Number.isFinite(rawMax) ? Math.max(0, Math.floor(rawMax)) : 16000;
+            let resolvedPath = input.workspacePath?.trim();
+            if (!resolvedPath && input.jobId != null && input.taskKey) {
+                try {
+                    resolvedPath = await resolveNotebookPathFromJob(client, input.jobId, input.taskKey, apiVersion, cts.token);
+                }
+                catch (err) {
+                    const message = formatNotebookPathResolutionError(input.jobId, input.taskKey, err);
+                    void vscode.window.showErrorMessage(message);
+                    return;
+                }
+            }
+            if (!resolvedPath) {
+                void vscode.window.showErrorMessage('Notebook path could not be resolved.');
+                return;
+            }
+            try {
+                const exported = await client.exportWorkspaceSource(resolvedPath);
+                const truncated = exported.source.length > maxSourceChars;
+                const source = truncated ? exported.source.slice(0, maxSourceChars) : exported.source;
+                const markdown = formatNotebookSource(resolvedPath, exported.language, source, truncated, maxSourceChars);
+                const output = (0, databricksClient_1.getOutputChannel)();
+                output.appendLine(markdown);
+                output.show(true);
+                void vscode.window.showInformationMessage(`Fetched notebook source for ${resolvedPath}`);
+            }
+            catch (err) {
+                const message = formatWorkspaceExportError(resolvedPath, err);
+                void vscode.window.showErrorMessage(message);
+            }
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.openPanel', async () => {
         await vscode.commands.executeCommand('workbench.view.extension.databricksTools');
     }));
@@ -486,6 +536,77 @@ function activate(context) {
     }));
 }
 function deactivate() { }
+async function promptNotebookSourceInput() {
+    const mode = await vscode.window.showQuickPick([
+        { label: 'Workspace path', description: 'Provide a Databricks workspace path', value: 'path' },
+        { label: 'Job + task', description: 'Resolve from jobId and taskKey', value: 'jobTask' },
+    ], { title: 'Get Notebook Source', placeHolder: 'Choose how to locate the notebook', ignoreFocusOut: true });
+    if (!mode) {
+        return undefined;
+    }
+    const maxSourceChars = await vscode.window.showInputBox({
+        title: 'Max source characters (optional)',
+        prompt: 'Leave empty for default 16000 characters. Large notebooks will be truncated to this length.',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return null;
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Enter a positive integer or leave empty';
+        },
+    });
+    const parsedMax = parseOptionalPositiveInt(maxSourceChars);
+    if (mode.value === 'path') {
+        const workspacePath = await vscode.window.showInputBox({
+            title: 'Workspace notebook path',
+            prompt: 'Enter the workspace path, e.g. /Workspace/Users/... or /Repos/...',
+            ignoreFocusOut: true,
+            validateInput: value => (value.trim() ? null : 'Workspace path is required'),
+        });
+        if (!workspacePath) {
+            return undefined;
+        }
+        return { workspacePath: workspacePath.trim(), maxSourceChars: parsedMax };
+    }
+    const jobId = await vscode.window.showInputBox({
+        title: 'Job ID',
+        prompt: 'Enter the Databricks job ID',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return 'Job ID is required';
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Job ID must be a number';
+        },
+    });
+    if (!jobId) {
+        return undefined;
+    }
+    const taskKey = await vscode.window.showInputBox({
+        title: 'Task key',
+        prompt: 'Enter the task key within the job',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Task key is required'),
+    });
+    if (!taskKey) {
+        return undefined;
+    }
+    return { jobId: Number(jobId.trim()), taskKey: taskKey.trim(), maxSourceChars: parsedMax };
+}
+function parseOptionalPositiveInt(value) {
+    if (!value) {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+        return undefined;
+    }
+    return Math.floor(parsed);
+}
 async function fetchTaskSources(client, tasks, maxSourceCharsPerTask, token) {
     const results = [];
     for (const task of tasks) {
