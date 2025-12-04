@@ -122,6 +122,21 @@ class DatabricksViewProvider {
             icon: 'beaker',
         }));
         items.push(new SimpleTreeItem({
+            label: 'List Clusters',
+            command: { command: 'databricksTools.listClusters', title: 'List Clusters' },
+            icon: 'server',
+        }));
+        items.push(new SimpleTreeItem({
+            label: 'Start Cluster…',
+            command: { command: 'databricksTools.startCluster', title: 'Start Cluster' },
+            icon: 'play',
+        }));
+        items.push(new SimpleTreeItem({
+            label: 'Get Job Definition…',
+            command: { command: 'databricksTools.getJobDefinition', title: 'Get Job Definition' },
+            icon: 'book',
+        }));
+        items.push(new SimpleTreeItem({
             label: 'Clear Credentials',
             command: { command: 'databricksTools.clearCredentials', title: 'Clear Credentials' },
             icon: 'trash',

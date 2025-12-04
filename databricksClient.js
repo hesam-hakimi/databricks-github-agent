@@ -87,22 +87,60 @@ class DatabricksClient {
         const { usedVersion } = await this.callJobsRunsList({ jobId: undefined, limit: 1 }, version, signal);
         return { usedVersion };
     }
+    async getJobDefinition(jobId, version, token) {
+        return this.callJobsGet(jobId, version, token);
+    }
+    async listClusters(token) {
+        const controller = new AbortController();
+        token.onCancellationRequested(() => controller.abort());
+        const url = `${this.host}/api/2.0/clusters/list`;
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+            },
+            signal: controller.signal,
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            throw new ApiError(`Clusters list failed ${res.status}: ${text || res.statusText}`, res.status, '2.0', text || res.statusText);
+        }
+        const parsed = text ? JSON.parse(text) : { clusters: [] };
+        return parsed.clusters ?? [];
+    }
+    async startCluster(clusterId, token) {
+        const controller = new AbortController();
+        token.onCancellationRequested(() => controller.abort());
+        const url = `${this.host}/api/2.0/clusters/start`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ cluster_id: clusterId }),
+            signal: controller.signal,
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            throw new ApiError(`Start cluster failed ${res.status}: ${text || res.statusText}`, res.status, '2.0', text || res.statusText);
+        }
+    }
     async callJobsRunsList(params, version, token) {
         const controller = new AbortController();
         token.onCancellationRequested(() => controller.abort());
-        const body = { limit: params.limit };
+        const searchParams = new URLSearchParams();
+        searchParams.set('limit', params.limit.toString());
         if (params.jobId !== undefined) {
-            body.job_id = params.jobId;
+            searchParams.set('job_id', params.jobId.toString());
         }
         const attempt = async (ver) => {
-            const url = `${this.host}/api/${ver}/jobs/runs/list`;
+            const url = `${this.host}/api/${ver}/jobs/runs/list?${searchParams.toString()}`;
             const res = await fetch(url, {
-                method: 'POST',
+                method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${this.token}`,
-                    'Content-Type': 'application/json',
                 },
-                body: JSON.stringify(body),
                 signal: controller.signal,
             });
             const text = await res.text();
@@ -126,6 +164,9 @@ class DatabricksClient {
         }
         catch (err) {
             if (err instanceof ApiError && isEndpointMissing(err)) {
+                if (isWrongMethodError(err)) {
+                    output.appendLine("Jobs API call used POST but /jobs/runs/list only supports GET. This should not happen; please verify the extension code.");
+                }
                 output.appendLine('Jobs API 2.1 not available, falling back to 2.0.');
                 try {
                     return await attempt('2.0');
@@ -133,6 +174,54 @@ class DatabricksClient {
                 catch (err2) {
                     if (err2 instanceof ApiError) {
                         throw new ApiError(`Jobs API 2.1 not available; 2.0 failed with ${err2.status}: ${err2.body ?? err2.message}`, err2.status, '2.0', err2.body ?? err2.message);
+                    }
+                    throw err2;
+                }
+            }
+            throw err;
+        }
+    }
+    async callJobsGet(jobId, version, token) {
+        const controller = new AbortController();
+        token.onCancellationRequested(() => controller.abort());
+        const searchParams = new URLSearchParams();
+        searchParams.set('job_id', jobId.toString());
+        const attempt = async (ver) => {
+            const url = `${this.host}/api/${ver}/jobs/get?${searchParams.toString()}`;
+            const res = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${this.token}`,
+                },
+                signal: controller.signal,
+            });
+            const text = await res.text();
+            if (!res.ok) {
+                const err = new ApiError(`Jobs API ${ver} get error ${res.status}: ${text || res.statusText}`, res.status, ver, text || res.statusText);
+                throw err;
+            }
+            const data = text ? JSON.parse(text) : {};
+            return { data, usedVersion: ver };
+        };
+        const output = getOutputChannel();
+        if (version === '2.0') {
+            return await attempt('2.0');
+        }
+        if (version === '2.1') {
+            return await attempt('2.1');
+        }
+        try {
+            return await attempt('2.1');
+        }
+        catch (err) {
+            if (err instanceof ApiError && isEndpointMissing(err)) {
+                output.appendLine('Jobs API get (2.1) not available, falling back to 2.0.');
+                try {
+                    return await attempt('2.0');
+                }
+                catch (err2) {
+                    if (err2 instanceof ApiError) {
+                        throw new ApiError(`Jobs API get 2.1 not available; 2.0 failed with ${err2.status}: ${err2.body ?? err2.message}`, err2.status, '2.0', err2.body ?? err2.message);
                     }
                     throw err2;
                 }
@@ -340,6 +429,9 @@ class ApiError extends Error {
     }
 }
 exports.ApiError = ApiError;
+function isWrongMethodError(err) {
+    return !!err.body && /post\s+\/jobs\/runs\/list/i.test(err.body);
+}
 function isEndpointMissing(err) {
     if (err.status === 404 || err.status === 405) {
         return true;
