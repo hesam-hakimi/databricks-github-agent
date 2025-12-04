@@ -39,6 +39,7 @@ exports.configureConnection = configureConnection;
 exports.clearStoredCredentials = clearStoredCredentials;
 exports.setAuthMode = setAuthMode;
 exports.getAuthStatus = getAuthStatus;
+exports.exportWorkspaceSource = exportWorkspaceSource;
 exports.getOutputChannel = getOutputChannel;
 const vscode = __importStar(require("vscode"));
 const util_1 = require("util");
@@ -125,6 +126,9 @@ class DatabricksClient {
         if (!res.ok) {
             throw new ApiError(`Start cluster failed ${res.status}: ${text || res.statusText}`, res.status, '2.0', text || res.statusText);
         }
+    }
+    async exportWorkspaceSource(path) {
+        return exportWorkspaceSource(this.host, this.token, path);
     }
     async callJobsRunsList(params, version, token) {
         const controller = new AbortController();
@@ -420,15 +424,73 @@ class ApiError extends Error {
     status;
     version;
     body;
-    constructor(message, status, version, body) {
+    errorCode;
+    constructor(message, status, version, body, errorCode) {
         super(message);
         this.status = status;
         this.version = version;
         this.body = body;
+        this.errorCode = errorCode;
         this.name = 'ApiError';
     }
 }
 exports.ApiError = ApiError;
+async function exportWorkspaceSource(host, token, path) {
+    const output = getOutputChannel();
+    const searchParams = new URLSearchParams();
+    searchParams.set('path', path);
+    searchParams.set('format', 'SOURCE');
+    searchParams.set('direct_download', 'false');
+    const url = `${host}/api/2.0/workspace/export?${searchParams.toString()}`;
+    const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            if (parsed.error_code) {
+                errCode = parsed.error_code;
+            }
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore JSON parse failures and rely on status/text
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        const bodyForLog = text || message || res.statusText;
+        output.appendLine(`Workspace export failed for path ${path}: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.0', bodyForLog, errCode);
+    }
+    if (!text) {
+        throw new Error('Workspace export returned an empty response.');
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        throw new Error('Workspace export returned invalid JSON.');
+    }
+    if (!parsed.content) {
+        throw new Error('Workspace export response is missing the content field.');
+    }
+    let decoded;
+    try {
+        decoded = Buffer.from(parsed.content, 'base64').toString('utf8');
+    }
+    catch {
+        throw new Error('Failed to decode workspace export content from base64.');
+    }
+    return { language: parsed.language, source: decoded };
+}
 function isWrongMethodError(err) {
     return !!err.body && /post\s+\/jobs\/runs\/list/i.test(err.body);
 }

@@ -145,17 +145,110 @@ class DatabricksGetJobDefinitionTool {
     async invoke(options, token) {
         const { jobId } = options.input;
         const includeRawJson = options.input.includeRawJson ?? false;
+        const includeTaskSource = options.input.includeTaskSource ?? false;
+        const rawMaxSourceChars = options.input.maxSourceCharsPerTask;
+        const maxSourceCharsPerTask = typeof rawMaxSourceChars === 'number' && Number.isFinite(rawMaxSourceChars)
+            ? Math.max(0, Math.floor(rawMaxSourceChars))
+            : 8000;
+        const sourceTaskLimit = 20; // normal jobs rarely exceed this; limit to protect output size
         const config = vscode.workspace.getConfiguration('databricksTools');
         const apiVersion = config.get('jobsApiVersion', 'auto');
         try {
             const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
             const { data, usedVersion } = await client.getJobDefinition(jobId, apiVersion, token);
-            const markdown = formatJobDefinition(jobId, data, usedVersion, includeRawJson);
+            const tasks = data.settings?.tasks ?? [];
+            const tasksForSource = includeTaskSource ? tasks.slice(0, sourceTaskLimit) : [];
+            const taskSources = includeTaskSource
+                ? await fetchTaskSources(client, tasksForSource, maxSourceCharsPerTask, token)
+                : undefined;
+            const markdown = formatJobDefinition(jobId, data, usedVersion, {
+                includeRawJson,
+                includeTaskSource,
+                taskSources,
+                maxSourceCharsPerTask,
+                sourceTaskLimit,
+                totalTasks: tasks.length,
+            });
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
         }
         catch (err) {
             const message = formatDatabricksError(err, 'job definition');
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksGetNotebookSourceTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const input = options.input;
+        const hasPath = !!input.workspacePath;
+        const message = hasPath
+            ? `Fetch Databricks notebook source for path ${input.workspacePath}.`
+            : `Resolve notebook path from job ${input.jobId} task ${input.taskKey} and fetch source.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Get Notebook Source',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        const input = options.input;
+        const workspacePath = input.workspacePath?.trim();
+        const jobId = input.jobId;
+        const taskKey = input.taskKey?.trim();
+        const rawMax = input.maxSourceChars;
+        const maxSourceChars = typeof rawMax === 'number' && Number.isFinite(rawMax) ? Math.max(0, Math.floor(rawMax)) : 16000;
+        const hasPath = !!workspacePath;
+        const hasJobTask = jobId != null && taskKey;
+        if (!hasPath && !hasJobTask) {
+            const msg = 'Provide either workspacePath, or jobId and taskKey, to fetch the notebook source. See input schema for details.';
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(msg)]);
+        }
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
+            const config = vscode.workspace.getConfiguration('databricksTools');
+            const apiVersion = config.get('jobsApiVersion', 'auto');
+            let resolvedPath = workspacePath;
+            if (!resolvedPath && hasJobTask && jobId != null && taskKey) {
+                try {
+                    resolvedPath = await resolveNotebookPathFromJob(client, jobId, taskKey, apiVersion, token);
+                }
+                catch (err) {
+                    const message = formatNotebookPathResolutionError(jobId, taskKey, err);
+                    return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+                }
+            }
+            if (!resolvedPath) {
+                const msg = 'Notebook path could not be resolved.';
+                return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(msg)]);
+            }
+            try {
+                const exported = await client.exportWorkspaceSource(resolvedPath);
+                const truncated = exported.source.length > maxSourceChars;
+                const source = truncated ? exported.source.slice(0, maxSourceChars) : exported.source;
+                const markdown = formatNotebookSource(resolvedPath, exported.language, source, truncated, maxSourceChars);
+                return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+            }
+            catch (err) {
+                const message = formatWorkspaceExportError(resolvedPath, err);
+                return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+            }
+        }
+        catch (err) {
+            if (err instanceof databricksClient_1.ConfigCancelled) {
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(`Configuration cancelled: ${err.message}`),
+                ]);
+            }
+            const message = err instanceof Error ? err.message : String(err);
+            const path = workspacePath || (taskKey ? `job ${jobId} task ${taskKey}` : 'unknown path');
+            const markdown = `Could not fetch notebook source for path \`${path}\`\n${message}`;
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
         }
     }
 }
@@ -221,6 +314,7 @@ function activate(context) {
     const tool = new DatabricksGetRunsTool(context);
     context.subscriptions.push(vscode.lm.registerTool('databricks_getRuns', tool));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_job_definition', new DatabricksGetJobDefinitionTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_get_notebook_source', new DatabricksGetNotebookSourceTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_list_clusters', new DatabricksListClustersTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_start_cluster', new DatabricksStartClusterTool(context)));
     const viewProvider = new databricksView_1.DatabricksViewProvider(context);
@@ -355,7 +449,7 @@ function activate(context) {
             const apiVersion = config.get('jobsApiVersion', 'auto');
             const client = await databricksClient_1.DatabricksClient.fromConfig(context);
             const { data, usedVersion } = await client.getJobDefinition(jobId, apiVersion, cts.token);
-            const markdown = formatJobDefinition(jobId, data, usedVersion, false);
+            const markdown = formatJobDefinition(jobId, data, usedVersion, { includeRawJson: false, includeTaskSource: false });
             const output = (0, databricksClient_1.getOutputChannel)();
             output.appendLine(markdown);
             output.show(true);
@@ -392,6 +486,139 @@ function activate(context) {
     }));
 }
 function deactivate() { }
+async function fetchTaskSources(client, tasks, maxSourceCharsPerTask, token) {
+    const results = [];
+    for (const task of tasks) {
+        if (token.isCancellationRequested) {
+            break;
+        }
+        const taskKey = task.task_key ?? 'n/a';
+        const target = resolveTaskSourceTarget(task);
+        if (target.skipReason) {
+            results.push({
+                taskKey,
+                taskType: target.type,
+                path: target.path,
+                error: target.skipReason,
+            });
+            continue;
+        }
+        if (!target.path) {
+            results.push({
+                taskKey,
+                taskType: target.type,
+                path: target.path,
+                error: 'No workspace path available for this task.',
+            });
+            continue;
+        }
+        try {
+            const exported = await client.exportWorkspaceSource(target.path);
+            const truncated = exported.source.length > maxSourceCharsPerTask;
+            results.push({
+                taskKey,
+                taskType: target.type,
+                path: target.path,
+                language: exported.language ?? undefined,
+                source: truncated ? exported.source.slice(0, maxSourceCharsPerTask) : exported.source,
+                truncated,
+            });
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            results.push({
+                taskKey,
+                taskType: target.type,
+                path: target.path,
+                error: message,
+            });
+        }
+    }
+    return results;
+}
+// Best-effort source resolution: notebooks are guaranteed; other task types need workspace paths and may be skipped.
+function resolveTaskSourceTarget(task) {
+    if (task.notebook_task?.notebook_path) {
+        return { type: 'notebook', path: task.notebook_task.notebook_path };
+    }
+    if (task.spark_python_task?.python_file) {
+        const path = task.spark_python_task.python_file;
+        if (!isWorkspacePath(path)) {
+            return {
+                type: 'python',
+                path,
+                skipReason: 'Source fetch skipped: path is not a workspace path (requires /Workspace, /Repos, /Users, or /Shared).',
+            };
+        }
+        return { type: 'python', path };
+    }
+    if (task.spark_jar_task) {
+        return { type: 'jar', skipReason: 'Jar tasks reference artifacts outside workspace export (DBFS/external).' };
+    }
+    if (task.spark_submit_task) {
+        return { type: 'spark-submit', skipReason: 'Spark submit tasks do not expose a workspace source path for export.' };
+    }
+    if (task.sql_task) {
+        return { type: 'sql', skipReason: 'SQL tasks reference queries/warehouses; workspace export is not supported.' };
+    }
+    if (task.python_wheel_task) {
+        return { type: 'python wheel', skipReason: 'Wheel tasks use package artifacts; workspace export not supported.' };
+    }
+    if (task.pipeline_task) {
+        return { type: 'pipeline', skipReason: 'Pipeline tasks do not expose a workspace path for source export.' };
+    }
+    return { type: 'task', skipReason: 'Task type not supported for workspace export.' };
+}
+async function resolveNotebookPathFromJob(client, jobId, taskKey, apiVersion, token) {
+    const { data } = await client.getJobDefinition(jobId, apiVersion, token);
+    const tasks = data.settings?.tasks ?? [];
+    const target = tasks.find(t => t.task_key === taskKey);
+    if (!target) {
+        throw new Error(`Task "${taskKey}" was not found in job ${jobId}.`);
+    }
+    if (!target.notebook_task || !target.notebook_task.notebook_path) {
+        throw new Error(`Task "${taskKey}" in job ${jobId} is not a notebook task or has no notebook_path. I cannot fetch notebook source for it.`);
+    }
+    return target.notebook_task.notebook_path;
+}
+function formatNotebookSource(path, language, source, truncated, maxSourceChars) {
+    const fence = languageToFence(language);
+    const langLabel = language ?? 'UNKNOWN';
+    const lines = [];
+    lines.push('## Notebook Source');
+    lines.push('');
+    lines.push(`Path: \`${path}\``);
+    lines.push(`Language: \`${langLabel}\``);
+    lines.push('');
+    lines.push(`\`\`\`${fence}`);
+    lines.push(source);
+    lines.push('```');
+    if (truncated) {
+        lines.push('');
+        lines.push(`Source truncated to ${maxSourceChars} characters. Ask the user to increase maxSourceChars if you need more of the notebook.`);
+    }
+    return lines.join('\n');
+}
+function formatWorkspaceExportError(path, err) {
+    if (err instanceof databricksClient_1.ApiError) {
+        const status = err.status ?? 'unknown';
+        const code = err.errorCode ? ` (${err.errorCode})` : '';
+        const detail = err.body ?? err.message;
+        return `Could not fetch notebook source for path \`${path}\`\nDatabricks Workspace API returned HTTP ${status}${code}: ${detail}`;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return `Could not fetch notebook source for path \`${path}\`\n${message}`;
+}
+function formatNotebookPathResolutionError(jobId, taskKey, err) {
+    if (err instanceof databricksClient_1.ApiError) {
+        const status = err.status ?? 'unknown';
+        const code = err.errorCode ? ` (${err.errorCode})` : '';
+        const detail = err.body ?? err.message;
+        return `Could not resolve notebook path for job ${jobId} task ${taskKey}.\nDatabricks Jobs API returned HTTP ${status}${code}: ${detail}`;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return message;
+}
 function formatDatabricksError(err, context) {
     if (err instanceof databricksClient_1.ConfigCancelled) {
         return `Configuration cancelled: ${err.message}`;
@@ -402,14 +629,34 @@ function formatDatabricksError(err, context) {
             : err.status === 401 || err.status === 403
                 ? 'Permission denied. Verify your PAT or Azure CLI login.'
                 : 'Check Databricks availability and credentials.';
-        return `Databricks ${context} failed (API ${err.version ?? 'unknown'}) HTTP ${err.status ?? 'unknown'}: ${err.body ?? err.message}. ${hint}`;
+        const code = err.errorCode ? ` (${err.errorCode})` : '';
+        return `Databricks ${context} failed (API ${err.version ?? 'unknown'}) HTTP ${err.status ?? 'unknown'}${code}: ${err.body ?? err.message}. ${hint}`;
     }
     const message = err instanceof Error ? err.message : String(err);
     return `Databricks ${context} failed: ${message}`;
 }
-function formatJobDefinition(jobId, data, usedVersion, includeRawJson) {
+function isWorkspacePath(path) {
+    const lowered = path.toLowerCase();
+    if (lowered.startsWith('dbfs:') || lowered.startsWith('/dbfs/')) {
+        return false;
+    }
+    if (/^[a-z]+:\/\//i.test(path)) {
+        return false;
+    }
+    if (lowered.startsWith('file:')) {
+        return false;
+    }
+    return path.startsWith('/');
+}
+function formatJobDefinition(jobId, data, usedVersion, options) {
+    const includeRawJson = options.includeRawJson ?? false;
+    const includeTaskSource = options.includeTaskSource ?? false;
+    const taskSources = options.taskSources ?? [];
+    const maxSourceCharsPerTask = Math.max(0, options.maxSourceCharsPerTask ?? 8000);
     const settings = data.settings ?? {};
     const tasks = settings.tasks ?? [];
+    const totalTasks = options.totalTasks ?? tasks.length;
+    const sourceTaskLimit = Math.max(0, options.sourceTaskLimit ?? totalTasks);
     const tags = settings.tags ?? {};
     const lines = [];
     lines.push(`# Databricks job ${settings.name ?? 'n/a'} (ID ${jobId})`);
@@ -441,6 +688,38 @@ function formatJobDefinition(jobId, data, usedVersion, includeRawJson) {
                 ? task.depends_on.map(d => d.task_key).filter(Boolean).join(', ')
                 : 'none';
             lines.push(`| ${task.task_key ?? 'n/a'} | ${typeAndResource.type} | ${typeAndResource.resource} | ${cluster} | ${depends} |`);
+        }
+    }
+    if (includeTaskSource) {
+        lines.push('');
+        lines.push('### Task Source Code');
+        if (tasks.length === 0) {
+            lines.push('No tasks available for source export.');
+        }
+        else {
+            if (totalTasks > sourceTaskLimit) {
+                lines.push(`Source export attempted for first ${sourceTaskLimit} of ${totalTasks} tasks (limit reached).`);
+            }
+            if (taskSources.length === 0) {
+                lines.push('_No task source code fetched._');
+            }
+            for (const ts of taskSources) {
+                lines.push('');
+                lines.push(`#### Task: ${ts.taskKey ?? 'n/a'} (type: ${ts.taskType})`);
+                const pathLabel = ts.taskType === 'notebook' ? 'Notebook path' : 'Path';
+                lines.push(`${pathLabel}: \`${ts.path ?? 'n/a'}\``);
+                if (ts.error) {
+                    lines.push(`_Could not fetch source for this task: ${ts.error}_`);
+                    continue;
+                }
+                const fence = languageToFence(ts.language);
+                lines.push(`\`\`\`${fence}`);
+                lines.push(ts.source ?? '');
+                lines.push('```');
+                if (ts.truncated) {
+                    lines.push(`_Source truncated to ${maxSourceCharsPerTask} characters. Ask the user to increase \`maxSourceCharsPerTask\` if more code is needed._`);
+                }
+            }
         }
     }
     if (includeRawJson) {
@@ -495,6 +774,24 @@ function summarizeTaskCluster(task) {
         return `${size}, node ${node}, spark ${version}${auto}`;
     }
     return 'default cluster';
+}
+function languageToFence(language) {
+    if (!language) {
+        return 'text';
+    }
+    const normalized = language.toLowerCase();
+    switch (normalized) {
+        case 'python':
+            return 'python';
+        case 'sql':
+            return 'sql';
+        case 'scala':
+            return 'scala';
+        case 'r':
+            return 'r';
+        default:
+            return 'text';
+    }
 }
 function formatClusterList(clusters, includeRawJson) {
     const lines = [];
