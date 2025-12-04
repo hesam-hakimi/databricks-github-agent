@@ -37,6 +37,7 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const databricksClient_1 = require("./databricksClient");
+const databricksView_1 = require("./databricksView");
 class DatabricksGetRunsTool {
     context;
     constructor(context) {
@@ -61,6 +62,10 @@ class DatabricksGetRunsTool {
         try {
             const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
             const runs = await client.listRuns(input.jobId, limit, token);
+            if (runs.length === 0) {
+                const msg = `Databricks Jobs API returned 200 but no runs were found for job ${input.jobId}. Verify the job ID, permissions, or try a different jobsApiVersion (e.g., set databricksTools.jobsApiVersion to 2.0).`;
+                return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(msg)]);
+            }
             const markdown = this.formatRuns(input.jobId, runs, limit, includeRawJson);
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
         }
@@ -69,6 +74,15 @@ class DatabricksGetRunsTool {
                 return new vscode.LanguageModelToolResult([
                     new vscode.LanguageModelTextPart(`Configuration cancelled: ${err.message}`),
                 ]);
+            }
+            if (err instanceof databricksClient_1.ApiError) {
+                const hint = err.status === 404 || err.status === 405 || (err.body && /endpoint not found/i.test(err.body))
+                    ? 'Jobs API endpoint missing. Try setting databricksTools.jobsApiVersion to 2.0 in settings.'
+                    : err.status === 401 || err.status === 403
+                        ? 'Permission denied. Verify your PAT or Azure CLI login.'
+                        : 'Check Databricks availability and your credentials.';
+                const message = `Databricks Jobs API (${err.version ?? 'unknown'}) returned HTTP ${err.status ?? 'unknown'}: ${err.body || err.message}. ${hint}`;
+                return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
             }
             const message = err instanceof Error ? err.message : String(err);
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(`Databricks error: ${message}`)]);
@@ -116,9 +130,13 @@ class DatabricksGetRunsTool {
 function activate(context) {
     const tool = new DatabricksGetRunsTool(context);
     context.subscriptions.push(vscode.lm.registerTool('databricks_getRuns', tool));
+    const viewProvider = new databricksView_1.DatabricksViewProvider(context);
+    const view = vscode.window.createTreeView('databricksTools.view', { treeDataProvider: viewProvider, showCollapseAll: false });
+    context.subscriptions.push(view);
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.configure', async () => {
         try {
             await (0, databricksClient_1.configureConnection)(context);
+            viewProvider.refresh('Configured');
         }
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -128,11 +146,68 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.clearCredentials', async () => {
         try {
             await (0, databricksClient_1.clearStoredCredentials)(context);
+            viewProvider.refresh('Credentials cleared');
         }
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             void vscode.window.showErrorMessage(`Failed to clear Databricks credentials: ${message}`);
         }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.testConnection', async () => {
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const cfg = await (0, databricksClient_1.ensureDatabricksConfig)(context);
+            const client = new databricksClient_1.DatabricksClient(cfg.host, cfg.token);
+            await client.testConnection(cts.token);
+            const msg = 'Connected to Databricks successfully.';
+            viewProvider.refresh('Connected');
+            void vscode.window.showInformationMessage(msg);
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            viewProvider.refresh(`Error: ${message}`);
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.testJobsApi', async () => {
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const cfg = await (0, databricksClient_1.ensureDatabricksConfig)(context);
+            const client = new databricksClient_1.DatabricksClient(cfg.host, cfg.token);
+            const config = vscode.workspace.getConfiguration('databricksTools');
+            const apiVersion = config.get('jobsApiVersion', 'auto');
+            const result = await client.testJobsApi(apiVersion, cts.token);
+            const msg = `Jobs API reachable (version used: ${result.usedVersion}).`;
+            viewProvider.refresh('Jobs API OK');
+            void vscode.window.showInformationMessage(msg);
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            viewProvider.refresh(`Jobs API error: ${message}`);
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.openPanel', async () => {
+        await vscode.commands.executeCommand('workbench.view.extension.databricksTools');
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.setAuthMode', async () => {
+        const pick = await vscode.window.showQuickPick([
+            { label: 'Auto', value: 'auto', description: 'Env PAT > Stored PAT > Azure CLI > prompt' },
+            { label: 'PAT only', value: 'pat', description: 'Use PAT from env/secret; prompt if missing.' },
+            { label: 'Azure CLI only', value: 'azureCli', description: 'Use az login to get token.' },
+        ], { title: 'Select Databricks auth mode', canPickMany: false, ignoreFocusOut: true });
+        if (!pick) {
+            return;
+        }
+        await (0, databricksClient_1.setAuthMode)(pick.value);
+        viewProvider.refresh(`Auth mode set to ${pick.value}`);
+        void vscode.window.showInformationMessage(`Databricks auth mode set to ${pick.value}.`);
     }));
 }
 function deactivate() { }

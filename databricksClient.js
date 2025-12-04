@@ -33,10 +33,13 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DatabricksClient = exports.ConfigCancelled = void 0;
+exports.ApiError = exports.DatabricksClient = exports.ConfigCancelled = void 0;
 exports.ensureDatabricksConfig = ensureDatabricksConfig;
 exports.configureConnection = configureConnection;
 exports.clearStoredCredentials = clearStoredCredentials;
+exports.setAuthMode = setAuthMode;
+exports.getAuthStatus = getAuthStatus;
+exports.getOutputChannel = getOutputChannel;
 const vscode = __importStar(require("vscode"));
 const util_1 = require("util");
 const child_process_1 = require("child_process");
@@ -60,92 +63,189 @@ class DatabricksClient {
         return new DatabricksClient(host, token);
     }
     async listRuns(jobId, limit, token) {
-        const url = `${this.host}/api/2.1/jobs/runs/list`;
-        const body = { job_id: jobId, limit };
+        const version = vscode.workspace.getConfiguration('databricksTools').get('jobsApiVersion', 'auto');
+        const { data } = await this.callJobsRunsList({ jobId, limit }, version, token);
+        return data.runs ?? [];
+    }
+    async testConnection(signal) {
+        const url = `${this.host}/api/2.0/clusters/list?limit=1`;
         const controller = new AbortController();
-        token.onCancellationRequested(() => controller.abort());
+        signal.onCancellationRequested(() => controller.abort());
         const res = await fetch(url, {
-            method: 'POST',
+            method: 'GET',
             headers: {
                 'Authorization': `Bearer ${this.token}`,
-                'Content-Type': 'application/json',
             },
-            body: JSON.stringify(body),
             signal: controller.signal,
         });
         if (!res.ok) {
             const text = await res.text();
-            throw new Error(`Databricks API error ${res.status}: ${text || res.statusText}`);
+            throw new Error(`Databricks connection test failed ${res.status}: ${text || res.statusText}`);
         }
-        const data = (await res.json());
-        return data.runs ?? [];
+    }
+    async testJobsApi(version, signal) {
+        const { usedVersion } = await this.callJobsRunsList({ jobId: undefined, limit: 1 }, version, signal);
+        return { usedVersion };
+    }
+    async callJobsRunsList(params, version, token) {
+        const controller = new AbortController();
+        token.onCancellationRequested(() => controller.abort());
+        const body = { limit: params.limit };
+        if (params.jobId !== undefined) {
+            body.job_id = params.jobId;
+        }
+        const attempt = async (ver) => {
+            const url = `${this.host}/api/${ver}/jobs/runs/list`;
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.token}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            });
+            const text = await res.text();
+            if (!res.ok) {
+                const err = new ApiError(`Jobs API ${ver} error ${res.status}: ${text || res.statusText}`, res.status, ver, text || res.statusText);
+                throw err;
+            }
+            const data = text ? JSON.parse(text) : { runs: [] };
+            return { data, usedVersion: ver };
+        };
+        const output = getOutputChannel();
+        if (version === '2.0') {
+            return await attempt('2.0');
+        }
+        if (version === '2.1') {
+            return await attempt('2.1');
+        }
+        // auto: try 2.1 then fallback on endpoint missing
+        try {
+            return await attempt('2.1');
+        }
+        catch (err) {
+            if (err instanceof ApiError && isEndpointMissing(err)) {
+                output.appendLine('Jobs API 2.1 not available, falling back to 2.0.');
+                try {
+                    return await attempt('2.0');
+                }
+                catch (err2) {
+                    if (err2 instanceof ApiError) {
+                        throw new ApiError(`Jobs API 2.1 not available; 2.0 failed with ${err2.status}: ${err2.body ?? err2.message}`, err2.status, '2.0', err2.body ?? err2.message);
+                    }
+                    throw err2;
+                }
+            }
+            throw err;
+        }
     }
 }
 exports.DatabricksClient = DatabricksClient;
-async function getAzureCliToken() {
+async function isAzureCliAvailable() {
     try {
-        // Databricks Azure resource ID
-        const resource = 'https://databricks.azure.net';
+        await exec('az --version');
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+async function isAzureCliLoggedIn() {
+    try {
+        const { stdout } = await exec('az account show');
+        return !!stdout;
+    }
+    catch {
+        return false;
+    }
+}
+async function getAzureCliToken(resource) {
+    const available = await isAzureCliAvailable();
+    if (!available) {
+        throw new Error('Azure CLI authentication failed: Azure CLI is not installed or not on PATH. Install Azure CLI or switch auth mode to PAT.');
+    }
+    try {
         const { stdout } = await exec(`az account get-access-token --resource ${resource} --query accessToken -o tsv`);
         const token = stdout.trim();
-        return token || undefined;
+        if (!token) {
+            throw new Error('Azure CLI authentication failed: token is empty. Run az login or check your subscription.');
+        }
+        return token;
     }
     catch (err) {
-        console.warn('Failed to acquire Azure CLI token', err);
-        return undefined;
+        throw new Error('Azure CLI authentication failed: unable to acquire token. Ensure you are logged in with az login and have access to Databricks.');
     }
 }
 async function ensureDatabricksConfig(context, options) {
     const envHost = (process.env.DATABRICKS_HOST || '').trim();
     const envToken = (process.env.DATABRICKS_TOKEN || '').trim();
     const config = vscode.workspace.getConfiguration('databricksTools');
-    const pref = config.get('authPreference', 'pat');
+    const authMode = config.get('authMode', 'auto');
+    const azureResource = config.get('azureCliResource', 'https://databricks.azure.net');
     const storedHost = (config.get('host') || '').trim();
     const storedToken = await context.secrets.get('databricksTools.token');
-    if (options?.forcePrompt) {
-        const host = await promptForHost(envHost || storedHost);
-        if (host === undefined) {
-            throw new ConfigCancelled('Configuration cancelled before host was provided.');
-        }
-        await saveHostSetting(host);
-        const token = await promptForToken();
-        if (token === undefined) {
-            throw new ConfigCancelled('Configuration cancelled before token was provided.');
-        }
-        await context.secrets.store('databricksTools.token', token);
-        return {
-            host: (process.env.DATABRICKS_HOST || host).replace(/\/$/, ''),
-            token: process.env.DATABRICKS_TOKEN || token,
-        };
-    }
+    // Host resolution
     let host = envHost || storedHost;
-    if (!host) {
-        const promptedHost = await promptForHost(storedHost);
+    if (!host || options?.forcePrompt) {
+        const promptedHost = await promptForHost(host);
         if (promptedHost === undefined) {
-            throw new ConfigCancelled('The Databricks host is missing. Ask the user to configure it or provide it now (configuration cancelled).');
+            throw new ConfigCancelled('The Databricks host is missing. Ask the user to configure it by running "Databricks Tools: Configure Connection" or provide it now.');
         }
         host = promptedHost;
         await saveHostSetting(promptedHost);
     }
-    let token = envToken;
-    if (!token && storedToken) {
-        token = storedToken;
+    if (!host) {
+        throw new Error('Databricks host is missing. Set DATABRICKS_HOST or configure the extension.');
     }
-    if (!token && pref === 'azureCli') {
-        token = (await getAzureCliToken()) || '';
-    }
-    if (!token) {
-        const promptedToken = await promptForToken();
-        if (promptedToken === undefined) {
-            throw new ConfigCancelled('The Databricks token is missing. Ask the user to configure it by providing a PAT or rerun configuration (cancelled).');
+    // Token resolution based on mode
+    const patResolver = async (allowPrompt) => {
+        if (envToken) {
+            return { host: host.replace(/\/$/, ''), token: envToken, authType: 'pat', source: 'env' };
         }
-        token = promptedToken;
-        await context.secrets.store('databricksTools.token', token);
+        if (storedToken) {
+            return { host: host.replace(/\/$/, ''), token: storedToken, authType: 'pat', source: 'secret' };
+        }
+        if (allowPrompt) {
+            const promptedToken = await promptForToken();
+            if (promptedToken === undefined) {
+                throw new ConfigCancelled('The Databricks token is missing. Ask the user to provide a PAT or rerun configuration (cancelled).');
+            }
+            await context.secrets.store('databricksTools.token', promptedToken);
+            return { host: host.replace(/\/$/, ''), token: promptedToken, authType: 'pat', source: 'prompted' };
+        }
+        return null;
+    };
+    const azureResolver = async () => {
+        const token = await getAzureCliToken(azureResource);
+        return { host: host.replace(/\/$/, ''), token, authType: 'azureCli', source: 'azureCli' };
+    };
+    if (authMode === 'pat') {
+        const pat = await patResolver(true);
+        if (!pat) {
+            throw new Error('PAT authentication required but no token available. Set DATABRICKS_TOKEN or provide a PAT.');
+        }
+        return pat;
     }
-    if (!token) {
-        throw new Error('Databricks token acquisition failed. Set DATABRICKS_TOKEN, use Azure CLI, or provide a PAT.');
+    if (authMode === 'azureCli') {
+        return await azureResolver();
     }
-    return { host: host.replace(/\/$/, ''), token };
+    // auto mode
+    const patAuto = await patResolver(false);
+    if (patAuto) {
+        return patAuto;
+    }
+    try {
+        return await azureResolver();
+    }
+    catch (err) {
+        // fallback to PAT prompt
+        const pat = await patResolver(true);
+        if (pat) {
+            return pat;
+        }
+        throw err;
+    }
 }
 async function configureConnection(context) {
     await ensureDatabricksConfig(context, { forcePrompt: true });
@@ -203,5 +303,57 @@ async function promptForToken() {
 async function saveHostSetting(host) {
     const config = vscode.workspace.getConfiguration('databricksTools');
     await config.update('host', host, vscode.ConfigurationTarget.Global);
+}
+async function setAuthMode(mode) {
+    const config = vscode.workspace.getConfiguration('databricksTools');
+    await config.update('authMode', mode, vscode.ConfigurationTarget.Global);
+}
+async function getAuthStatus(context) {
+    const envHost = (process.env.DATABRICKS_HOST || '').trim();
+    const envToken = (process.env.DATABRICKS_TOKEN || '').trim();
+    const config = vscode.workspace.getConfiguration('databricksTools');
+    const authMode = config.get('authMode', 'auto');
+    const storedHost = (config.get('host') || '').trim();
+    const storedToken = await context.secrets.get('databricksTools.token');
+    const azureCliAvailable = await isAzureCliAvailable();
+    const azureCliLoggedIn = azureCliAvailable ? await isAzureCliLoggedIn() : false;
+    return {
+        hostConfigured: !!(envHost || storedHost),
+        hostSource: envHost ? 'env' : storedHost ? 'settings' : null,
+        authMode,
+        patAvailable: !!(envToken || storedToken),
+        patSource: envToken ? 'env' : storedToken ? 'secret' : null,
+        azureCliAvailable,
+        azureCliLoggedIn,
+    };
+}
+class ApiError extends Error {
+    status;
+    version;
+    body;
+    constructor(message, status, version, body) {
+        super(message);
+        this.status = status;
+        this.version = version;
+        this.body = body;
+        this.name = 'ApiError';
+    }
+}
+exports.ApiError = ApiError;
+function isEndpointMissing(err) {
+    if (err.status === 404 || err.status === 405) {
+        return true;
+    }
+    if (err.body && /endpoint not found/i.test(err.body)) {
+        return true;
+    }
+    return false;
+}
+let outputChannel;
+function getOutputChannel() {
+    if (!outputChannel) {
+        outputChannel = vscode.window.createOutputChannel('Databricks Tools');
+    }
+    return outputChannel;
 }
 //# sourceMappingURL=databricksClient.js.map
