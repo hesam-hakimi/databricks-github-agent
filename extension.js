@@ -386,6 +386,10 @@ function activate(context) {
         viewProvider.refresh(`Auth mode set to ${pick.value}`);
         void vscode.window.showInformationMessage(`Databricks auth mode set to ${pick.value}.`);
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.showLogs', async () => {
+        const output = (0, databricksClient_1.getOutputChannel)();
+        output.show(true);
+    }));
 }
 function deactivate() { }
 function formatDatabricksError(err, context) {

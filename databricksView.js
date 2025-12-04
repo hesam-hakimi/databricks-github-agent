@@ -49,6 +49,14 @@ class SimpleTreeItem extends vscode.TreeItem {
         }
     }
 }
+class SectionTreeItem extends vscode.TreeItem {
+    children;
+    constructor(children, label) {
+        super(label, vscode.TreeItemCollapsibleState.Expanded);
+        this.children = children;
+        this.iconPath = new vscode.ThemeIcon('folder');
+    }
+}
 class DatabricksViewProvider {
     context;
     _onDidChangeTreeData = new vscode.EventEmitter();
@@ -64,84 +72,101 @@ class DatabricksViewProvider {
     getTreeItem(element) {
         return element;
     }
-    async getChildren() {
+    async getChildren(element) {
+        if (element instanceof SectionTreeItem) {
+            return element.children;
+        }
         const status = await (0, databricksClient_1.getAuthStatus)(this.context);
-        const items = [];
-        items.push(new SimpleTreeItem({
-            label: this.lastConnectionStatus ? `Status: ${this.lastConnectionStatus}` : 'Status: Not tested',
-            description: 'Click to test',
-            command: { command: 'databricksTools.testConnection', title: 'Test Connection' },
-            icon: this.lastConnectionStatus?.startsWith('Connected') ? 'check' : 'plug',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Host',
-            description: status.hostConfigured ? status.hostSource === 'env' ? 'Env override' : 'Configured' : 'Not configured',
-            tooltip: status.hostConfigured ? 'Databricks workspace host' : 'Host not set',
-            command: { command: 'databricksTools.configure', title: 'Configure Connection' },
-            icon: status.hostConfigured ? 'cloud' : 'warning',
-        }));
-        items.push(new SimpleTreeItem({
-            label: `Auth mode: ${status.authMode}`,
-            description: 'auto/pat/azureCli',
-            command: { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
-            icon: 'key',
-        }));
-        items.push(new SimpleTreeItem({
-            label: `PAT available: ${status.patAvailable ? 'yes' : 'no'}`,
-            description: status.patSource ? `source: ${status.patSource}` : undefined,
-            icon: status.patAvailable ? 'shield' : 'error',
-        }));
-        items.push(new SimpleTreeItem({
-            label: `Azure CLI: ${status.azureCliAvailable ? 'available' : 'not found'}`,
-            description: status.azureCliAvailable
-                ? status.azureCliLoggedIn
-                    ? 'logged in'
-                    : 'not logged in'
-                : 'install Azure CLI',
-            icon: status.azureCliAvailable ? 'terminal' : 'warning',
-            command: status.azureCliAvailable ? undefined : { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Configure Connection',
-            command: { command: 'databricksTools.configure', title: 'Configure Connection' },
-            icon: 'gear',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Switch Auth Mode',
-            command: { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
-            icon: 'sync',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Test Connection',
-            command: { command: 'databricksTools.testConnection', title: 'Test Connection' },
-            icon: 'debug-start',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Test Jobs API',
-            command: { command: 'databricksTools.testJobsApi', title: 'Test Jobs API' },
-            icon: 'beaker',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'List Clusters',
-            command: { command: 'databricksTools.listClusters', title: 'List Clusters' },
-            icon: 'server',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Start Cluster…',
-            command: { command: 'databricksTools.startCluster', title: 'Start Cluster' },
-            icon: 'play',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Get Job Definition…',
-            command: { command: 'databricksTools.getJobDefinition', title: 'Get Job Definition' },
-            icon: 'book',
-        }));
-        items.push(new SimpleTreeItem({
-            label: 'Clear Credentials',
-            command: { command: 'databricksTools.clearCredentials', title: 'Clear Credentials' },
-            icon: 'trash',
-        }));
-        return items;
+        const connectionItems = [
+            new SimpleTreeItem({
+                label: this.lastConnectionStatus ? `Status: ${this.lastConnectionStatus}` : 'Status: Not tested',
+                description: 'Click to test',
+                command: { command: 'databricksTools.testConnection', title: 'Test Connection' },
+                icon: this.lastConnectionStatus?.startsWith('Connected') ? 'check' : 'plug',
+            }),
+            new SimpleTreeItem({
+                label: 'Host',
+                description: status.hostConfigured ? (status.hostSource === 'env' ? 'Env override' : 'Configured') : 'Not configured',
+                tooltip: status.hostConfigured ? 'Databricks workspace host' : 'Host not set',
+                command: { command: 'databricksTools.configure', title: 'Configure Connection' },
+                icon: status.hostConfigured ? 'cloud' : 'warning',
+            }),
+            new SimpleTreeItem({
+                label: `Auth mode: ${status.authMode}`,
+                description: 'auto/pat/azureCli',
+                command: { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
+                icon: 'key',
+            }),
+            new SimpleTreeItem({
+                label: `PAT available: ${status.patAvailable ? 'yes' : 'no'}`,
+                description: status.patSource ? `source: ${status.patSource}` : undefined,
+                icon: status.patAvailable ? 'shield' : 'error',
+            }),
+            new SimpleTreeItem({
+                label: `Azure CLI: ${status.azureCliAvailable ? 'available' : 'not found'}`,
+                description: status.azureCliAvailable
+                    ? status.azureCliLoggedIn
+                        ? 'logged in'
+                        : 'not logged in'
+                    : 'install Azure CLI',
+                icon: status.azureCliAvailable ? 'terminal' : 'warning',
+                command: status.azureCliAvailable ? undefined : { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
+            }),
+            new SimpleTreeItem({
+                label: 'Configure Connection',
+                command: { command: 'databricksTools.configure', title: 'Configure Connection' },
+                icon: 'gear',
+            }),
+            new SimpleTreeItem({
+                label: 'Switch Auth Mode',
+                command: { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
+                icon: 'sync',
+            }),
+            new SimpleTreeItem({
+                label: 'Clear Credentials',
+                command: { command: 'databricksTools.clearCredentials', title: 'Clear Credentials' },
+                icon: 'trash',
+            }),
+        ];
+        const toolsItems = [
+            new SimpleTreeItem({
+                label: 'Get Job Definition…',
+                command: { command: 'databricksTools.getJobDefinition', title: 'Get Job Definition' },
+                icon: 'book',
+            }),
+            new SimpleTreeItem({
+                label: 'List Clusters',
+                command: { command: 'databricksTools.listClusters', title: 'List Clusters' },
+                icon: 'server',
+            }),
+            new SimpleTreeItem({
+                label: 'Start Cluster…',
+                command: { command: 'databricksTools.startCluster', title: 'Start Cluster' },
+                icon: 'play',
+            }),
+        ];
+        const debugItems = [
+            new SimpleTreeItem({
+                label: 'Test Connection',
+                command: { command: 'databricksTools.testConnection', title: 'Test Connection' },
+                icon: 'debug-start',
+            }),
+            new SimpleTreeItem({
+                label: 'Test Jobs API',
+                command: { command: 'databricksTools.testJobsApi', title: 'Test Jobs API' },
+                icon: 'beaker',
+            }),
+            new SimpleTreeItem({
+                label: 'Show Logs',
+                command: { command: 'databricksTools.showLogs', title: 'Show Logs' },
+                icon: 'output',
+            }),
+        ];
+        return [
+            new SectionTreeItem(connectionItems, 'Connection'),
+            new SectionTreeItem(toolsItems, 'Tools'),
+            new SectionTreeItem(debugItems, 'Debug'),
+        ];
     }
 }
 exports.DatabricksViewProvider = DatabricksViewProvider;
