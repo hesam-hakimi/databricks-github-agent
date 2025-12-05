@@ -92,6 +92,37 @@ class DatabricksGetRunsTool {
         return formatRunsMarkdown(jobId, runs, limit, includeRawJson);
     }
 }
+class DatabricksGetRunDetailsTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const { runId } = options.input;
+        const message = `Fetch Databricks run details for run ${runId}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Get Run Details',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        const { runId } = options.input;
+        const includeRawJson = options.input.includeRawJson ?? false;
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
+            const run = await client.getRunDetails(runId);
+            const markdown = formatRunDetails(run, includeRawJson);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run details');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
 class DatabricksGetJobDefinitionTool {
     context;
     constructor(context) {
@@ -217,14 +248,14 @@ class DatabricksGetNotebookSourceTool {
         }
     }
 }
-class DatabricksCreateJobFromCodeTool {
+class DatabricksCreateAndRunJobFromCodeTool {
     context;
     constructor(context) {
         this.context = context;
     }
     async prepareInvocation(options, _token) {
         const { jobName } = options.input;
-        const message = `Upload code and submit a Databricks run for job ${jobName}.`;
+        const message = `Upload code, create a Databricks job, and start a run for ${jobName}.`;
         return {
             invocationMessage: message,
             confirmationMessages: {
@@ -236,7 +267,7 @@ class DatabricksCreateJobFromCodeTool {
     async invoke(options, _token) {
         const input = options.input;
         try {
-            const markdown = await createJobFromCode(this.context, input);
+            const markdown = await createAndRunJobFromCode(this.context, input);
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
         }
         catch (err) {
@@ -261,9 +292,10 @@ class DatabricksListClustersTool {
     }
     async invoke(options, token) {
         const includeRawJson = options.input.includeRawJson ?? false;
+        const includeInteractiveClusters = options.input.includeInteractiveClusters ?? true;
         try {
             const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
-            const clusters = await client.listClusters(token);
+            const clusters = await client.listClusters(token, { includeInteractiveClusters });
             const markdown = formatClusterList(clusters, includeRawJson);
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
         }
@@ -308,7 +340,8 @@ function activate(context) {
     context.subscriptions.push(vscode.lm.registerTool('databricks_getRuns', tool));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_job_definition', new DatabricksGetJobDefinitionTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_notebook_source', new DatabricksGetNotebookSourceTool(context)));
-    context.subscriptions.push(vscode.lm.registerTool('databricks_create_job_from_code', new DatabricksCreateJobFromCodeTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_create_and_run_job_from_code', new DatabricksCreateAndRunJobFromCodeTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_get_run_details', new DatabricksGetRunDetailsTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_list_clusters', new DatabricksListClustersTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_start_cluster', new DatabricksStartClusterTool(context)));
     const viewProvider = new databricksView_1.DatabricksViewProvider(context);
@@ -516,14 +549,53 @@ function activate(context) {
             if (!input) {
                 return;
             }
-            const markdown = await createJobFromCode(context, input);
+            const markdown = await createAndRunJobFromCode(context, input);
             const output = (0, databricksClient_1.getOutputChannel)();
             output.appendLine(markdown);
             output.show(true);
-            void vscode.window.showInformationMessage('Job submitted to Databricks.');
+            void vscode.window.showInformationMessage('Job created and run started on Databricks.');
         }
         catch (err) {
             const message = formatDatabricksError(err, 'create and run job from code');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.getRunDetails', async () => {
+        const runIdInput = await vscode.window.showInputBox({
+            title: 'Databricks Run ID',
+            prompt: 'Enter the run ID to fetch details',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim()) {
+                    return 'Run ID is required';
+                }
+                return /^\d+$/.test(value.trim()) ? null : 'Run ID must be a number';
+            },
+        });
+        if (!runIdInput) {
+            return;
+        }
+        const includeRawJsonPick = await vscode.window.showQuickPick([
+            { label: 'No', description: 'Summarized output', value: false },
+            { label: 'Yes', description: 'Include raw JSON', value: true },
+        ], { title: 'Include raw JSON output?', ignoreFocusOut: true });
+        const includeRawJson = includeRawJsonPick?.value ?? false;
+        const runId = Number(runIdInput.trim());
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            const run = await client.getRunDetails(runId);
+            const markdown = formatRunDetails(run, includeRawJson);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage(`Fetched details for run ${runId}.`);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run details');
             void vscode.window.showErrorMessage(message);
         }
         finally {
@@ -807,7 +879,7 @@ function parseOptionalPositiveInt(value) {
     }
     return Math.floor(parsed);
 }
-async function createJobFromCode(context, input) {
+async function createAndRunJobFromCode(context, input) {
     const jobName = input.jobName?.trim();
     const sourceCode = input.sourceCode;
     if (!jobName || !sourceCode) {
@@ -835,11 +907,12 @@ async function createJobFromCode(context, input) {
     const defaultFolder = getDefaultUploadFolder();
     const targetPath = buildWorkspaceUploadPath(jobName, language, input.workspacePath, defaultFolder);
     await client.importWorkspaceSource(targetPath, language, sourceCode);
-    const result = await client.submitRunFromNotebook(jobName, targetPath, clusterMode, {
+    const { jobId } = await client.createJobFromNotebook(jobName, targetPath, clusterMode, {
         existingClusterId: input.existingClusterId,
         newClusterConfig,
     });
-    return formatCreateJobResult(jobName, targetPath, clusterMode, input.existingClusterId, newClusterConfig, result);
+    const { runId } = await client.runJobNow(jobId);
+    return formatCreateAndRunJobResult(jobId, runId, jobName, targetPath, clusterMode, input.existingClusterId, newClusterConfig);
 }
 async function fetchTaskSources(client, tasks, maxSourceCharsPerTask, token) {
     const results = [];
@@ -954,14 +1027,12 @@ function formatNotebookSource(path, language, source, truncated, maxSourceChars)
     }
     return lines.join('\n');
 }
-function formatCreateJobResult(jobName, path, clusterMode, existingClusterId, newClusterConfig, result) {
+function formatCreateAndRunJobResult(jobId, runId, jobName, path, clusterMode, existingClusterId, newClusterConfig) {
     const lines = [];
-    lines.push('## Job submitted to Databricks');
+    lines.push('## Job created and run started on Databricks');
     lines.push('');
-    lines.push(`Run ID: \`${result.runId}\``);
-    if (result.jobId !== undefined) {
-        lines.push(`Job ID: \`${result.jobId}\``);
-    }
+    lines.push(`Job ID: \`${jobId}\``);
+    lines.push(`Run ID: \`${runId}\``);
     lines.push(`Run name: \`${jobName}\``);
     lines.push(`Notebook path: \`${path}\``);
     if (clusterMode === 'existingCluster') {
@@ -972,8 +1043,9 @@ function formatCreateJobResult(jobName, path, clusterMode, existingClusterId, ne
     }
     lines.push('');
     lines.push('You can now:');
-    lines.push('- Ask me to monitor this run with `getDatabricksRuns` by providing the job/run details.');
+    lines.push('- Ask me to fetch run details with `getDatabricksRunDetails` or recent runs with `getDatabricksRuns`.');
     lines.push('- Open the run in the Databricks UI if you prefer (use the run ID above).');
+    lines.push('- Re-run the job later via Databricks UI using the job ID above.');
     return lines.join('\n');
 }
 function formatWorkspaceExportError(path, err) {
@@ -1031,6 +1103,47 @@ function formatRunsMarkdown(jobId, runs, limit, includeRawJson) {
         if (runs.length > truncated.length) {
             lines.push(`(truncated to ${truncated.length} of ${runs.length} runs)`);
         }
+    }
+    return lines.join('\n');
+}
+function formatRunDetails(run, includeRawJson) {
+    const lines = [];
+    const start = run.start_time ? new Date(run.start_time).toLocaleString() : 'n/a';
+    const end = run.end_time ? new Date(run.end_time).toLocaleString() : 'n/a';
+    const durationSeconds = run.start_time && run.end_time ? ((run.end_time - run.start_time) / 1000).toFixed(1) : 'n/a';
+    const state = run.state?.life_cycle_state ?? 'unknown';
+    const result = run.state?.result_state ?? 'unknown';
+    const msg = run.state?.state_message ?? '';
+    lines.push(`# Databricks run ${run.run_id ?? 'n/a'}`);
+    lines.push(`- job_id: ${run.job_id ?? 'n/a'}`);
+    lines.push(`- number_in_job: ${run.number_in_job ?? 'n/a'}`);
+    lines.push(`- state: ${state}`);
+    lines.push(`- result: ${result}`);
+    if (msg) {
+        lines.push(`- message: ${msg}`);
+    }
+    lines.push(`- start: ${start}`);
+    lines.push(`- end: ${end}`);
+    lines.push(`- duration_s: ${durationSeconds}`);
+    lines.push(`- cluster_id: ${run.cluster_instance?.cluster_id ?? 'n/a'}`);
+    const clusterDesc = run.cluster_spec?.new_cluster
+        ? `${run.cluster_spec.new_cluster.node_type_id ?? 'node'} / spark ${run.cluster_spec.new_cluster.spark_version ?? 'n/a'}`
+        : 'n/a';
+    lines.push(`- cluster_spec: ${clusterDesc}`);
+    if (run.tasks && run.tasks.length) {
+        lines.push('');
+        lines.push('## Tasks');
+        lines.push('| task | notebook |');
+        lines.push('| --- | --- |');
+        for (const t of run.tasks) {
+            lines.push(`| ${t.task_key ?? 'n/a'} | ${t.notebook_task?.notebook_path ?? 'n/a'} |`);
+        }
+    }
+    if (includeRawJson) {
+        lines.push('');
+        lines.push('```json');
+        lines.push(JSON.stringify(run, null, 2));
+        lines.push('```');
     }
     return lines.join('\n');
 }
@@ -1271,8 +1384,8 @@ function formatClusterList(clusters, includeRawJson) {
     lines.push(`- total: ${total}`);
     lines.push(`- by state: ${Object.entries(byState).map(([k, v]) => `${k}:${v}`).join(', ') || 'n/a'}`);
     lines.push('');
-    lines.push('| cluster_id | name | state | size | spark_version | node_type | auto-termination |');
-    lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+    lines.push('| cluster_id | name | state | source | size | spark_version | node_type | auto-termination |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
     const display = clusters.slice(0, 50);
     for (const c of display) {
         const size = c.autoscale
@@ -1280,7 +1393,8 @@ function formatClusterList(clusters, includeRawJson) {
             : `${c.num_workers ?? '?'} workers`;
         const node = c.node_type_id || c.driver_node_type_id || 'n/a';
         const auto = c.autotermination_minutes != null ? `${c.autotermination_minutes}m` : 'n/a';
-        lines.push(`| ${c.cluster_id ?? 'n/a'} | ${c.cluster_name ?? 'n/a'} | ${c.state ?? 'n/a'} | ${size} | ${c.spark_version ?? 'n/a'} | ${node} | ${auto} |`);
+        const source = c.cluster_source ?? 'n/a';
+        lines.push(`| ${c.cluster_id ?? 'n/a'} | ${c.cluster_name ?? 'n/a'} | ${c.state ?? 'n/a'} | ${source} | ${size} | ${c.spark_version ?? 'n/a'} | ${node} | ${auto} |`);
     }
     if (clusters.length > display.length) {
         lines.push('');

@@ -140,14 +140,19 @@ class DatabricksViewProvider {
                 icon: 'file-code',
             }),
             new SimpleTreeItem({
-                label: 'Create Job From Code…',
-                command: { command: 'databricksTools.createJobFromCode', title: 'Create Job From Code' },
+                label: 'Create & Run Job From Code…',
+                command: { command: 'databricksTools.createJobFromCode', title: 'Create & Run Job From Code' },
                 icon: 'rocket',
             }),
             new SimpleTreeItem({
                 label: 'Get Job Runs…',
                 command: { command: 'databricksTools.getRuns', title: 'Get Job Runs' },
                 icon: 'list-ordered',
+            }),
+            new SimpleTreeItem({
+                label: 'Get Run Details…',
+                command: { command: 'databricksTools.getRunDetails', title: 'Get Run Details' },
+                icon: 'search',
             }),
             new SimpleTreeItem({
                 label: 'List Clusters',

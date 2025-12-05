@@ -41,7 +41,9 @@ exports.setAuthMode = setAuthMode;
 exports.getAuthStatus = getAuthStatus;
 exports.exportWorkspaceSource = exportWorkspaceSource;
 exports.importWorkspaceSource = importWorkspaceSource;
-exports.submitRunFromNotebook = submitRunFromNotebook;
+exports.createJobFromNotebook = createJobFromNotebook;
+exports.runJobNow = runJobNow;
+exports.getRunDetails = getRunDetails;
 exports.getOutputChannel = getOutputChannel;
 const vscode = __importStar(require("vscode"));
 const util_1 = require("util");
@@ -93,7 +95,7 @@ class DatabricksClient {
     async getJobDefinition(jobId, version, token) {
         return this.callJobsGet(jobId, version, token);
     }
-    async listClusters(token) {
+    async listClusters(token, options) {
         const controller = new AbortController();
         token.onCancellationRequested(() => controller.abort());
         const url = `${this.host}/api/2.0/clusters/list`;
@@ -109,7 +111,11 @@ class DatabricksClient {
             throw new ApiError(`Clusters list failed ${res.status}: ${text || res.statusText}`, res.status, '2.0', text || res.statusText);
         }
         const parsed = text ? JSON.parse(text) : { clusters: [] };
-        return parsed.clusters ?? [];
+        const clusters = parsed.clusters ?? [];
+        if (options?.includeInteractiveClusters === false) {
+            return clusters.filter(c => (c.cluster_source ?? '').toUpperCase() !== 'UI');
+        }
+        return clusters;
     }
     async startCluster(clusterId, token) {
         const controller = new AbortController();
@@ -135,8 +141,14 @@ class DatabricksClient {
     async importWorkspaceSource(path, language, sourceCode) {
         return importWorkspaceSource(this.host, this.token, path, language, sourceCode);
     }
-    async submitRunFromNotebook(runName, notebookPath, clusterMode, options) {
-        return submitRunFromNotebook(this.host, this.token, runName, notebookPath, clusterMode, options);
+    async createJobFromNotebook(jobName, notebookPath, clusterMode, options) {
+        return createJobFromNotebook(this.host, this.token, jobName, notebookPath, clusterMode, options);
+    }
+    async runJobNow(jobId) {
+        return runJobNow(this.host, this.token, jobId);
+    }
+    async getRunDetails(runId) {
+        return getRunDetails(this.host, this.token, runId);
     }
     async callJobsRunsList(params, version, token) {
         const controller = new AbortController();
@@ -536,9 +548,9 @@ async function importWorkspaceSource(host, token, path, language, sourceCode) {
         throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.0', text || message, errCode);
     }
 }
-async function submitRunFromNotebook(host, token, runName, notebookPath, clusterMode, options) {
+async function createJobFromNotebook(host, token, jobName, notebookPath, clusterMode, options) {
     const output = getOutputChannel();
-    const url = `${host}/api/2.1/jobs/runs/submit`;
+    const url = `${host}/api/2.1/jobs/create`;
     const task = {
         task_key: 'main',
         notebook_task: { notebook_path: notebookPath },
@@ -562,7 +574,7 @@ async function submitRunFromNotebook(host, token, runName, notebookPath, cluster
         };
     }
     const payload = {
-        run_name: runName,
+        name: jobName,
         tasks: [task],
     };
     const res = await fetch(url, {
@@ -585,10 +597,10 @@ async function submitRunFromNotebook(host, token, runName, notebookPath, cluster
             }
         }
         catch {
-            // ignore JSON parsing issues
+            // ignore
         }
         const suffix = errCode ? ` ${errCode}` : '';
-        output.appendLine(`runs/submit failed: HTTP ${res.status}${suffix} ${message}`);
+        output.appendLine(`jobs/create failed: HTTP ${res.status}${suffix} ${message}`);
         throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
     }
     let parsed = {};
@@ -596,12 +608,95 @@ async function submitRunFromNotebook(host, token, runName, notebookPath, cluster
         parsed = text ? JSON.parse(text) : {};
     }
     catch {
-        throw new Error('runs/submit returned invalid JSON.');
+        throw new Error('jobs/create returned invalid JSON.');
+    }
+    if (!parsed.job_id) {
+        throw new Error('jobs/create did not return job_id.');
+    }
+    return { jobId: parsed.job_id };
+}
+async function runJobNow(host, token, jobId) {
+    const output = getOutputChannel();
+    const url = `${host}/api/2.1/jobs/run-now`;
+    const payload = { job_id: jobId };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`jobs/run-now failed: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
+    }
+    let parsed = {};
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new Error('jobs/run-now returned invalid JSON.');
     }
     if (!parsed.run_id) {
-        throw new Error('runs/submit did not return run_id.');
+        throw new Error('jobs/run-now did not return run_id.');
     }
-    return { runId: parsed.run_id, jobId: parsed.job_id };
+    return { runId: parsed.run_id };
+}
+async function getRunDetails(host, token, runId) {
+    const output = getOutputChannel();
+    const searchParams = new URLSearchParams();
+    searchParams.set('run_id', runId.toString());
+    const url = `${host}/api/2.1/jobs/runs/get?${searchParams.toString()}`;
+    const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`runs/get failed: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
+    }
+    let parsed = {};
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new Error('runs/get returned invalid JSON.');
+    }
+    if (!parsed.run_id) {
+        output.appendLine('runs/get returned response without run_id field.');
+    }
+    return parsed;
 }
 function isWrongMethodError(err) {
     return !!err.body && /post\s+\/jobs\/runs\/list/i.test(err.body);
