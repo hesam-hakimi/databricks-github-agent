@@ -35,9 +35,11 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
+exports.createAndRunJobFromCode = createAndRunJobFromCode;
 const vscode = __importStar(require("vscode"));
 const databricksClient_1 = require("./databricksClient");
 const databricksView_1 = require("./databricksView");
+const workspacePath_1 = require("./workspacePath");
 class DatabricksGetRunsTool {
     context;
     constructor(context) {
@@ -119,6 +121,63 @@ class DatabricksGetRunDetailsTool {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'run details');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksAnalyzeRunPerformanceTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const { runId } = options.input;
+        const message = `Analyze performance for Databricks run ${runId}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Analyze Run Performance',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        const { runId } = options.input;
+        const includeRawJson = options.input.includeRawJson ?? false;
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
+            const markdown = await analyzeRunPerformance(client, runId, includeRawJson, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run performance analysis');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksProfileTableLayoutTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const target = options.input.tableName?.trim() || options.input.tablePath?.trim() || 'table/path';
+        const message = `Profile Databricks table layout for ${target}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Profile Table Layout',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await profileTableLayout(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'table layout profiling');
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
         }
     }
@@ -360,6 +419,8 @@ function activate(context) {
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_notebook_source', new DatabricksGetNotebookSourceTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_create_and_run_job_from_code', new DatabricksCreateAndRunJobFromCodeTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_run_details', new DatabricksGetRunDetailsTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_analyze_run_performance', new DatabricksAnalyzeRunPerformanceTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_profile_table_layout', new DatabricksProfileTableLayoutTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_list_clusters', new DatabricksListClustersTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_start_cluster', new DatabricksStartClusterTool(context)));
     const viewProvider = new databricksView_1.DatabricksViewProvider(context);
@@ -416,6 +477,42 @@ function activate(context) {
         finally {
             cts.dispose();
         }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.setDefaultWorkspaceFolder', async () => {
+        const current = (0, databricksClient_1.getDefaultWorkspaceFolder)();
+        const input = await vscode.window.showInputBox({
+            title: 'Default Databricks workspace folder',
+            prompt: 'Enter default Databricks workspace folder (e.g. /Workspace/Users/<user>/Jobs)',
+            value: current || '/Workspace/Shared/CopilotJobs',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                const trimmed = value.trim();
+                if (!trimmed) {
+                    return 'Workspace folder is required';
+                }
+                if (!trimmed.startsWith('/Workspace/')) {
+                    return 'Path must start with /Workspace/.';
+                }
+                if (/\.(py|sql|scala|r)$/i.test(trimmed)) {
+                    return 'Provide a folder path, not a file path.';
+                }
+                return null;
+            },
+        });
+        if (!input) {
+            return;
+        }
+        const trimmed = input.trim();
+        await (0, databricksClient_1.setDefaultWorkspaceFolder)(trimmed);
+        viewProvider.refresh('Workspace folder updated');
+        void vscode.window.showInformationMessage(`Default workspace folder set to ${trimmed}`);
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.toggleAppendProjectSubfolder', async () => {
+        const current = (0, databricksClient_1.getAppendProjectSubfolder)();
+        await (0, databricksClient_1.setAppendProjectSubfolder)(!current);
+        const state = !current ? 'enabled' : 'disabled';
+        viewProvider.refresh(`Append project subfolder ${state}`);
+        void vscode.window.showInformationMessage(`Append project subfolder ${state}.`);
     }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.testConnection', async () => {
         const cts = new vscode.CancellationTokenSource();
@@ -667,6 +764,131 @@ function activate(context) {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'run details');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.analyzeRunPerformance', async () => {
+        const runIdInput = await vscode.window.showInputBox({
+            title: 'Databricks Run ID',
+            prompt: 'Enter the run ID to analyze performance',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim()) {
+                    return 'Run ID is required';
+                }
+                return /^\d+$/.test(value.trim()) ? null : 'Run ID must be a number';
+            },
+        });
+        if (!runIdInput) {
+            return;
+        }
+        const includeRawJsonPick = await vscode.window.showQuickPick([
+            { label: 'No', description: 'Summary only', value: false },
+            { label: 'Yes', description: 'Include raw JSON', value: true },
+        ], { title: 'Include raw JSON output?', ignoreFocusOut: true });
+        const includeRawJson = includeRawJsonPick?.value ?? false;
+        const runId = Number(runIdInput.trim());
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            const markdown = await analyzeRunPerformance(client, runId, includeRawJson, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage(`Performance analysis ready for run ${runId}.`);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run performance analysis');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.profileTableLayout', async () => {
+        const targetMode = await vscode.window.showQuickPick([
+            { label: 'Unity Catalog table', description: 'catalog.schema.table', value: 'table' },
+            { label: 'Delta path', description: 'dbfs:/... or /Volumes/...', value: 'path' },
+        ], { title: 'Profile target', ignoreFocusOut: true });
+        if (!targetMode) {
+            return;
+        }
+        let tableName;
+        let tablePath;
+        if (targetMode.value === 'table') {
+            const input = await vscode.window.showInputBox({
+                title: 'Table name',
+                prompt: 'Enter full table name, e.g., catalog.schema.table',
+                ignoreFocusOut: true,
+                validateInput: value => (value.trim() ? null : 'Table name is required'),
+            });
+            if (!input) {
+                return;
+            }
+            tableName = input.trim();
+        }
+        else {
+            const input = await vscode.window.showInputBox({
+                title: 'Table path',
+                prompt: 'Enter Delta table path, e.g., dbfs:/mnt/data/table or /Volumes/catalog/schema/table',
+                ignoreFocusOut: true,
+                validateInput: value => (value.trim() ? null : 'Table path is required'),
+            });
+            if (!input) {
+                return;
+            }
+            tablePath = input.trim();
+        }
+        const historyLimitInput = await vscode.window.showInputBox({
+            title: 'History rows (optional)',
+            prompt: 'Number of history entries to include (default 5)',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim()) {
+                    return null;
+                }
+                return /^\d+$/.test(value.trim()) ? null : 'Enter a non-negative integer or leave empty';
+            },
+        });
+        const historyLimit = historyLimitInput && historyLimitInput.trim() ? Number(historyLimitInput.trim()) : undefined;
+        const clusterModePick = await vscode.window.showQuickPick([
+            { label: 'Use default cluster (recommended)', value: 'defaultCluster' },
+            { label: 'Pick an existing cluster', value: 'existingCluster' },
+        ], { title: 'Choose cluster', ignoreFocusOut: true });
+        if (!clusterModePick) {
+            return;
+        }
+        let existingClusterId;
+        if (clusterModePick.value === 'existingCluster') {
+            const ctsPick = new vscode.CancellationTokenSource();
+            try {
+                const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+                const picked = await pickClusterFromList(client, ctsPick.token, {
+                    title: 'Select existing cluster for profiling',
+                    placeHolder: 'Cluster to run profiling job',
+                });
+                if (!picked?.id) {
+                    return;
+                }
+                existingClusterId = picked.id;
+            }
+            finally {
+                ctsPick.dispose();
+            }
+        }
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await profileTableLayout(context, { tableName, tablePath, historyLimit, clusterMode: clusterModePick.value, existingClusterId }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage('Table layout profiling completed.');
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'table layout profiling');
             void vscode.window.showErrorMessage(message);
         }
         finally {
@@ -1215,8 +1437,16 @@ async function createAndRunJobFromCode(context, input, token) {
             autoStarted: resolved.autoStarted,
         };
     }
-    const defaultFolder = getDefaultUploadFolder();
-    const targetPath = buildWorkspaceUploadPath(jobName, language, input.workspacePath, defaultFolder);
+    const uploadSettings = (0, databricksClient_1.getWorkspaceUploadSettings)();
+    const projectName = vscode.workspace.workspaceFolders?.[0]?.name;
+    const targetPath = (0, workspacePath_1.computeUploadWorkspacePath)({
+        explicitWorkspacePath: input.workspacePath,
+        jobName,
+        language,
+        defaultWorkspaceFolder: uploadSettings.folder,
+        appendProjectSubfolder: uploadSettings.appendProjectSubfolder,
+        projectName,
+    });
     await client.importWorkspaceSource(targetPath, language, sourceCode);
     const { jobId } = await client.createJobFromNotebook(jobName, targetPath, clusterModeForJob, {
         existingClusterId,
@@ -1224,6 +1454,251 @@ async function createAndRunJobFromCode(context, input, token) {
     });
     const { runId } = await client.runJobNow(jobId);
     return formatCreateAndRunJobResult(jobId, runId, jobName, targetPath, clusterInfo, newClusterConfig);
+}
+const TABLE_PROFILE_NOTEBOOK_SOURCE = [
+    '# Databricks table layout profiler',
+    'import json',
+    'table_name = dbutils.widgets.get("tableName") or ""',
+    'table_path = dbutils.widgets.get("tablePath") or ""',
+    'history_limit_raw = dbutils.widgets.get("historyLimit") or "5"',
+    'history_limit = int(history_limit_raw) if history_limit_raw else 5',
+    '',
+    'def quote_identifier(name: str) -> str:',
+    '    parts = [p for p in name.split(".") if p]',
+    "    return '.'.join(['`' + p.replace('`', '``') + '`' for p in parts])",
+    '',
+    'def describe_detail(target_sql: str):',
+    '    return spark.sql(target_sql).first().asDict()',
+    '',
+    'result = {}',
+    '',
+    'try:',
+    '    if table_name:',
+    '        target = f"DESCRIBE DETAIL {quote_identifier(table_name)}"',
+    '    else:',
+    "        safe_path = table_path.replace('`', '``')",
+    '        target = f"DESCRIBE DETAIL delta.`{safe_path}`"',
+    '    result["detail"] = describe_detail(target)',
+    '',
+    '    if table_name and history_limit > 0:',
+    '        history_q = f"DESCRIBE HISTORY {quote_identifier(table_name)} LIMIT {history_limit}"',
+    '        history_rows = [json.loads(r) for r in spark.sql(history_q).toJSON().take(history_limit)]',
+    '        result["history"] = history_rows',
+    '',
+    '    dbutils.notebook.exit(json.dumps(result, default=str))',
+    'except Exception as e:',
+    '    dbutils.notebook.exit(json.dumps({"error": str(e)}))',
+].join('\n');
+async function analyzeRunPerformance(client, runId, includeRawJson, token) {
+    const run = await client.getRunDetails(runId, token);
+    let cluster;
+    const clusterId = run.cluster_instance?.cluster_id;
+    if (clusterId) {
+        try {
+            cluster = await client.getCluster(clusterId);
+        }
+        catch {
+            // best-effort only
+        }
+    }
+    return formatRunPerformance(run, cluster, includeRawJson);
+}
+async function profileTableLayout(context, input, token) {
+    const tableName = input.tableName?.trim();
+    const tablePath = input.tablePath?.trim();
+    if (!tableName && !tablePath) {
+        throw new Error('Provide tableName or tablePath to profile the table layout.');
+    }
+    const historyLimitRaw = input.historyLimit;
+    const historyLimit = normalizeOptionalInt(typeof historyLimitRaw === 'number' ? historyLimitRaw : undefined, 5);
+    const clusterMode = input.clusterMode ?? 'defaultCluster';
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const resolvedCluster = await resolveClusterForExecution(context, client, clusterMode, input.existingClusterId, token ?? new vscode.CancellationTokenSource().token);
+    const uploadSettings = (0, databricksClient_1.getWorkspaceUploadSettings)();
+    const projectName = vscode.workspace.workspaceFolders?.[0]?.name;
+    const notebookPath = (0, workspacePath_1.computeUploadWorkspacePath)({
+        jobName: 'table-layout-profile',
+        language: 'PYTHON',
+        defaultWorkspaceFolder: uploadSettings.folder,
+        appendProjectSubfolder: uploadSettings.appendProjectSubfolder,
+        projectName,
+    });
+    await client.importWorkspaceSource(notebookPath, 'PYTHON', TABLE_PROFILE_NOTEBOOK_SOURCE);
+    const baseParameters = {
+        tableName: tableName ?? '',
+        tablePath: tablePath ?? '',
+        historyLimit: historyLimit.toString(),
+    };
+    const runName = tableName ? `Profile ${tableName}` : `Profile ${tablePath}`;
+    const { runId } = await client.submitNotebookRun(notebookPath, resolvedCluster.clusterId, runName, baseParameters, token);
+    const runDetails = await waitForRunCompletion(client, runId, token, {
+        pollIntervalMs: 5000,
+        timeoutMs: 12 * 60 * 1000,
+    });
+    const output = await client.getRunOutput(runId, token);
+    const parsed = parseTableProfileOutput(output.notebook_output?.result);
+    return formatTableLayoutProfile({
+        targetLabel: tableName ?? tablePath ?? 'table',
+        runId,
+        notebookPath,
+        cluster: resolvedCluster,
+        runState: runDetails.state?.life_cycle_state,
+        resultState: runDetails.state?.result_state,
+        detail: parsed.detail,
+        history: parsed.history,
+        error: parsed.error,
+    });
+}
+function parseTableProfileOutput(result) {
+    if (!result) {
+        return {};
+    }
+    try {
+        const parsed = JSON.parse(result);
+        return parsed;
+    }
+    catch {
+        return { error: 'Profiling job returned output that could not be parsed as JSON.' };
+    }
+}
+async function waitForRunCompletion(client, runId, token, options) {
+    const start = Date.now();
+    const pollIntervalMs = options.pollIntervalMs ?? 5000;
+    const timeoutMs = options.timeoutMs ?? 10 * 60 * 1000;
+    let lastState;
+    while (Date.now() - start < timeoutMs) {
+        const run = await client.getRunDetails(runId, token);
+        const state = run.state?.life_cycle_state;
+        if (state && state !== lastState) {
+            (0, databricksClient_1.getOutputChannel)().appendLine(`Run ${runId} state: ${state}`);
+            lastState = state;
+        }
+        const normalized = (state || '').toUpperCase();
+        if (normalized === 'TERMINATED' || normalized === 'INTERNAL_ERROR' || normalized === 'SKIPPED') {
+            return run;
+        }
+        if (token?.isCancellationRequested) {
+            throw new Error('Profiling was cancelled.');
+        }
+        await delay(pollIntervalMs);
+    }
+    throw new Error(`Run ${runId} did not complete within ${Math.round(timeoutMs / 1000)} seconds.`);
+}
+function formatRunPerformance(run, cluster, includeRawJson) {
+    const lines = [];
+    const state = run.state?.life_cycle_state ?? 'unknown';
+    const result = run.state?.result_state ?? 'unknown';
+    const message = run.state?.state_message ?? '';
+    const start = run.start_time ? new Date(run.start_time).toLocaleString() : 'n/a';
+    const end = run.end_time ? new Date(run.end_time).toLocaleString() : 'n/a';
+    const durationSeconds = run.start_time && run.end_time ? ((run.end_time - run.start_time) / 1000).toFixed(1) : 'n/a';
+    const setupSeconds = run.setup_duration != null ? (run.setup_duration / 1000).toFixed(1) : 'n/a';
+    const executionSeconds = run.execution_duration != null ? (run.execution_duration / 1000).toFixed(1) : 'n/a';
+    const cleanupSeconds = run.cleanup_duration != null ? (run.cleanup_duration / 1000).toFixed(1) : 'n/a';
+    lines.push(`# Run performance for ${run.run_id ?? 'n/a'}`);
+    lines.push(`- state: ${state}`);
+    lines.push(`- result: ${result}`);
+    if (message) {
+        lines.push(`- message: ${message}`);
+    }
+    lines.push(`- start: ${start}`);
+    lines.push(`- end: ${end}`);
+    lines.push(`- duration_s: ${durationSeconds}`);
+    lines.push(`- setup_s: ${setupSeconds}, execution_s: ${executionSeconds}, cleanup_s: ${cleanupSeconds}`);
+    const clusterId = run.cluster_instance?.cluster_id ?? 'n/a';
+    const clusterLabel = cluster?.cluster_name ?? clusterId;
+    const clusterSource = cluster?.cluster_source ? ` (${cluster.cluster_source})` : '';
+    lines.push(`- cluster: ${clusterLabel}${clusterSource}`);
+    if (run.tasks?.length) {
+        lines.push('');
+        lines.push('## Tasks');
+        lines.push('| task | notebook |');
+        lines.push('| --- | --- |');
+        for (const t of run.tasks) {
+            lines.push(`| ${t.task_key ?? 'n/a'} | ${t.notebook_task?.notebook_path ?? 'n/a'} |`);
+        }
+    }
+    if (includeRawJson) {
+        lines.push('');
+        lines.push('```json');
+        lines.push(JSON.stringify(run, null, 2));
+        lines.push('```');
+    }
+    return lines.join('\n');
+}
+function formatTableLayoutProfile(args) {
+    const lines = [];
+    lines.push(`# Table layout profile`);
+    lines.push(`- target: ${args.targetLabel}`);
+    lines.push(`- run_id: ${args.runId}`);
+    lines.push(`- run_state: ${args.runState ?? 'unknown'} / ${args.resultState ?? 'unknown'}`);
+    const clusterLabel = args.cluster.clusterName ?? args.cluster.clusterId;
+    const autoStartNote = args.cluster.autoStarted ? ` (auto-started from ${args.cluster.initialState ?? 'unknown'})` : '';
+    const clusterSource = args.cluster.clusterSource ? ` [${args.cluster.clusterSource}]` : '';
+    lines.push(`- cluster: ${clusterLabel} (${args.cluster.clusterId})${clusterSource}${autoStartNote}`);
+    lines.push(`- notebook path: \`${args.notebookPath}\``);
+    if (args.error) {
+        lines.push('');
+        lines.push(`Profiling failed: ${args.error}`);
+        return lines.join('\n');
+    }
+    if (!args.detail) {
+        lines.push('');
+        lines.push('Profiling completed but no layout detail was returned.');
+    }
+    if (args.detail) {
+        const format = String(args.detail['format'] ?? 'n/a');
+        const numFiles = args.detail['numFiles'] != null ? String(args.detail['numFiles']) : 'n/a';
+        const sizeBytes = typeof args.detail['sizeInBytes'] === 'number' ? args.detail['sizeInBytes'] : undefined;
+        const numRows = args.detail['numRows'] != null ? String(args.detail['numRows']) : 'n/a';
+        const partitions = Array.isArray(args.detail['partitionColumns'])
+            ? args.detail['partitionColumns'].map(v => String(v)).join(', ')
+            : 'n/a';
+        const numPartitions = args.detail['numPartitions'] != null ? String(args.detail['numPartitions']) : 'n/a';
+        const location = args.detail['location'] ? String(args.detail['location']) : 'n/a';
+        lines.push('');
+        lines.push('## Layout');
+        lines.push(`- format: ${format}`);
+        lines.push(`- size: ${sizeBytes != null ? formatSizeBytes(sizeBytes) : 'n/a'}`);
+        lines.push(`- numFiles: ${numFiles}`);
+        lines.push(`- numRows: ${numRows}`);
+        lines.push(`- partitions: ${partitions}`);
+        lines.push(`- numPartitions: ${numPartitions}`);
+        lines.push(`- location: ${location}`);
+    }
+    if (args.history && args.history.length) {
+        lines.push('');
+        lines.push('## Recent operations');
+        lines.push('| timestamp | operation | user | read_version | operation_metrics |');
+        lines.push('| --- | --- | --- | --- | --- |');
+        const rows = args.history.slice(0, 10);
+        for (const row of rows) {
+            const ts = row['timestamp'] ? String(row['timestamp']) : 'n/a';
+            const op = row['operation'] ? String(row['operation']) : 'n/a';
+            const user = row['user_id'] ? String(row['user_id']) : row['user_name'] ? String(row['user_name']) : 'n/a';
+            const readVersion = row['readVersion'] != null ? String(row['readVersion']) : row['read_version'] != null ? String(row['read_version']) : 'n/a';
+            const metrics = row['operationMetrics'] ?? row['operation_metrics'];
+            const metricsStr = metrics ? JSON.stringify(metrics) : 'n/a';
+            lines.push(`| ${ts} | ${op} | ${user} | ${readVersion} | ${metricsStr} |`);
+        }
+    }
+    return lines.join('\n');
+}
+async function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+function formatSizeBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) {
+        return 'n/a';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+    }
+    return `${size.toFixed(1)} ${units[unitIndex]}`;
 }
 async function fetchTaskSources(client, tasks, maxSourceCharsPerTask, token) {
     const results = [];
@@ -1345,7 +1820,7 @@ function formatCreateAndRunJobResult(jobId, runId, jobName, path, clusterInfo, n
     lines.push(`Job ID: \`${jobId}\``);
     lines.push(`Run ID: \`${runId}\``);
     lines.push(`Run name: \`${jobName}\``);
-    lines.push(`Notebook path: \`${path}\``);
+    lines.push(`Workspace path: \`${path}\``);
     if (clusterInfo.mode === 'newJobCluster' && newClusterConfig) {
         lines.push(`Cluster mode: newJobCluster (runtime ${newClusterConfig.sparkVersion}, node ${newClusterConfig.nodeTypeId}, workers ${newClusterConfig.numWorkers ?? 1}, auto-term ${newClusterConfig.autoTerminationMinutes ?? 60}m)`);
     }
@@ -1474,47 +1949,6 @@ function formatRunDetails(run, includeRawJson) {
         lines.push('```');
     }
     return lines.join('\n');
-}
-function getDefaultUploadFolder() {
-    const cfg = vscode.workspace.getConfiguration('databricksTools');
-    const folder = (cfg.get('defaultUploadFolder') || '/Workspace/Shared/CopilotJobs').trim();
-    return folder || '/Workspace/Shared/CopilotJobs';
-}
-function buildWorkspaceUploadPath(jobName, language, explicitPath, defaultFolder) {
-    if (explicitPath && explicitPath.trim()) {
-        return explicitPath.trim();
-    }
-    const ext = languageToExtension(language);
-    const safeName = sanitizeName(jobName || 'job');
-    const timestamp = formatTimestamp(new Date());
-    const baseFolder = defaultFolder.replace(/\/$/, '');
-    return `${baseFolder}/${safeName}-${timestamp}.${ext}`;
-}
-function sanitizeName(name) {
-    return name.trim().toLowerCase().replace(/[^a-z0-9-_]+/g, '-').replace(/^-+|-+$/g, '') || 'job';
-}
-function formatTimestamp(d) {
-    const pad = (n) => n.toString().padStart(2, '0');
-    const yyyy = d.getFullYear();
-    const mm = pad(d.getMonth() + 1);
-    const dd = pad(d.getDate());
-    const hh = pad(d.getHours());
-    const mi = pad(d.getMinutes());
-    const ss = pad(d.getSeconds());
-    return `${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
-}
-function languageToExtension(language) {
-    const normalized = (language || '').toUpperCase();
-    switch (normalized) {
-        case 'SQL':
-            return 'sql';
-        case 'SCALA':
-            return 'scala';
-        case 'R':
-            return 'r';
-        default:
-            return 'py';
-    }
 }
 function normalizeOptionalInt(value, fallback) {
     if (value === undefined || value === null) {

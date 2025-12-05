@@ -78,6 +78,7 @@ class DatabricksViewProvider {
         }
         const status = await (0, databricksClient_1.getAuthStatus)(this.context);
         const defaultCluster = await (0, databricksClient_1.getDefaultCluster)(this.context);
+        const uploadSettings = (0, databricksClient_1.getWorkspaceUploadSettings)();
         const connectionItems = [
             new SimpleTreeItem({
                 label: this.lastConnectionStatus ? `Status: ${this.lastConnectionStatus}` : 'Status: Not tested',
@@ -127,6 +128,18 @@ class DatabricksViewProvider {
                 icon: defaultCluster.id ? 'server' : 'warning',
             }),
             new SimpleTreeItem({
+                label: uploadSettings.isFallback
+                    ? `Workspace upload folder: not set (using ${uploadSettings.folder})`
+                    : `Workspace upload folder: ${uploadSettings.folder}`,
+                command: { command: 'databricksTools.setDefaultWorkspaceFolder', title: 'Set Default Workspace Folder' },
+                icon: 'folder',
+            }),
+            new SimpleTreeItem({
+                label: `Append project subfolder: ${uploadSettings.appendProjectSubfolder ? 'on' : 'off'}`,
+                command: { command: 'databricksTools.toggleAppendProjectSubfolder', title: 'Toggle Append Project Subfolder' },
+                icon: uploadSettings.appendProjectSubfolder ? 'check' : 'circle-slash',
+            }),
+            new SimpleTreeItem({
                 label: 'Switch Auth Mode',
                 command: { command: 'databricksTools.setAuthMode', title: 'Switch Auth Mode' },
                 icon: 'sync',
@@ -174,6 +187,18 @@ class DatabricksViewProvider {
                 icon: 'play',
             }),
         ];
+        const performanceItems = [
+            new SimpleTreeItem({
+                label: 'Analyze Run Performance…',
+                command: { command: 'databricksTools.analyzeRunPerformance', title: 'Analyze Run Performance' },
+                icon: 'pulse',
+            }),
+            new SimpleTreeItem({
+                label: 'Profile Table Layout…',
+                command: { command: 'databricksTools.profileTableLayout', title: 'Profile Table Layout' },
+                icon: 'database',
+            }),
+        ];
         const debugItems = [
             new SimpleTreeItem({
                 label: 'Test Connection',
@@ -194,6 +219,7 @@ class DatabricksViewProvider {
         return [
             new SectionTreeItem(connectionItems, 'Connection'),
             new SectionTreeItem(toolsItems, 'Tools'),
+            new SectionTreeItem(performanceItems, 'Performance'),
             new SectionTreeItem(debugItems, 'Debug'),
         ];
     }

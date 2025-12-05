@@ -39,6 +39,11 @@ exports.configureConnection = configureConnection;
 exports.getDefaultCluster = getDefaultCluster;
 exports.setDefaultCluster = setDefaultCluster;
 exports.clearDefaultCluster = clearDefaultCluster;
+exports.getWorkspaceUploadSettings = getWorkspaceUploadSettings;
+exports.getDefaultWorkspaceFolder = getDefaultWorkspaceFolder;
+exports.setDefaultWorkspaceFolder = setDefaultWorkspaceFolder;
+exports.getAppendProjectSubfolder = getAppendProjectSubfolder;
+exports.setAppendProjectSubfolder = setAppendProjectSubfolder;
 exports.clearStoredCredentials = clearStoredCredentials;
 exports.setAuthMode = setAuthMode;
 exports.getAuthStatus = getAuthStatus;
@@ -46,12 +51,15 @@ exports.exportWorkspaceSource = exportWorkspaceSource;
 exports.importWorkspaceSource = importWorkspaceSource;
 exports.createJobFromNotebook = createJobFromNotebook;
 exports.runJobNow = runJobNow;
+exports.submitNotebookRun = submitNotebookRun;
 exports.ensureClusterRunning = ensureClusterRunning;
 exports.getRunDetails = getRunDetails;
+exports.getRunOutput = getRunOutput;
 exports.getOutputChannel = getOutputChannel;
 const vscode = __importStar(require("vscode"));
 const util_1 = require("util");
 const child_process_1 = require("child_process");
+const workspacePath_1 = require("./workspacePath");
 const exec = (0, util_1.promisify)(child_process_1.exec);
 class ConfigCancelled extends Error {
     constructor(message) {
@@ -187,8 +195,19 @@ class DatabricksClient {
     async runJobNow(jobId) {
         return runJobNow(this.host, this.token, jobId);
     }
-    async getRunDetails(runId) {
-        return getRunDetails(this.host, this.token, runId);
+    async getRunDetails(runId, cancelToken) {
+        return getRunDetails(this.host, this.token, runId, cancelToken);
+    }
+    async getRunOutput(runId, cancelToken) {
+        return getRunOutput(this.host, this.token, runId, cancelToken);
+    }
+    async submitNotebookRun(notebookPath, clusterId, runName, baseParameters, cancelToken) {
+        return submitNotebookRun(this.host, this.token, {
+            notebookPath,
+            clusterId,
+            runName,
+            baseParameters,
+        }, cancelToken);
     }
     async callJobsRunsList(params, version, token) {
         const controller = new AbortController();
@@ -420,6 +439,30 @@ async function clearDefaultCluster(context) {
     await config.update('defaultClusterId', '', vscode.ConfigurationTarget.Global);
     await config.update('defaultClusterName', '', vscode.ConfigurationTarget.Global);
     void vscode.window.showInformationMessage('Default Databricks cluster cleared.');
+}
+function getWorkspaceUploadSettings() {
+    const cfg = vscode.workspace.getConfiguration('databricksTools');
+    const raw = cfg.get('defaultWorkspaceFolder') ?? cfg.get('defaultUploadFolder');
+    const normalized = (0, workspacePath_1.normalizeCandidateWorkspaceFolder)(raw);
+    const folder = normalized ?? workspacePath_1.DEFAULT_WORKSPACE_FOLDER;
+    const appendProjectSubfolder = cfg.get('appendProjectSubfolder', false);
+    return { folder, isFallback: !normalized, appendProjectSubfolder: !!appendProjectSubfolder };
+}
+function getDefaultWorkspaceFolder() {
+    return getWorkspaceUploadSettings().folder;
+}
+async function setDefaultWorkspaceFolder(path) {
+    const cfg = vscode.workspace.getConfiguration('databricksTools');
+    const normalized = (0, workspacePath_1.normalizeCandidateWorkspaceFolder)(path) ?? workspacePath_1.DEFAULT_WORKSPACE_FOLDER;
+    await cfg.update('defaultWorkspaceFolder', normalized, vscode.ConfigurationTarget.Global);
+    await cfg.update('defaultUploadFolder', normalized, vscode.ConfigurationTarget.Global);
+}
+function getAppendProjectSubfolder() {
+    return vscode.workspace.getConfiguration('databricksTools').get('appendProjectSubfolder', false);
+}
+async function setAppendProjectSubfolder(value) {
+    const cfg = vscode.workspace.getConfiguration('databricksTools');
+    await cfg.update('appendProjectSubfolder', !!value, vscode.ConfigurationTarget.Global);
 }
 async function clearStoredCredentials(context) {
     const choice = await vscode.window.showQuickPick([
@@ -714,6 +757,63 @@ async function runJobNow(host, token, jobId) {
     }
     return { runId: parsed.run_id };
 }
+async function submitNotebookRun(host, token, args, cancelToken) {
+    const output = getOutputChannel();
+    const url = `${host}/api/2.1/jobs/runs/submit`;
+    const payload = {
+        run_name: args.runName,
+        existing_cluster_id: args.clusterId,
+        tasks: [
+            {
+                task_key: 'main',
+                notebook_task: {
+                    notebook_path: args.notebookPath,
+                    base_parameters: args.baseParameters ?? {},
+                },
+            },
+        ],
+    };
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`jobs/runs/submit failed: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
+    }
+    let parsed = {};
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new Error('jobs/runs/submit returned invalid JSON.');
+    }
+    if (!parsed.run_id) {
+        throw new Error('jobs/runs/submit did not return run_id.');
+    }
+    return { runId: parsed.run_id };
+}
 async function ensureClusterRunning(host, token, clusterId, options) {
     const poll = options?.poll ?? true;
     const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000;
@@ -807,16 +907,19 @@ async function ensureClusterRunning(host, token, clusterId, options) {
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
-async function getRunDetails(host, token, runId) {
+async function getRunDetails(host, token, runId, cancelToken) {
     const output = getOutputChannel();
     const searchParams = new URLSearchParams();
     searchParams.set('run_id', runId.toString());
     const url = `${host}/api/2.1/jobs/runs/get?${searchParams.toString()}`;
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
     const res = await fetch(url, {
         method: 'GET',
         headers: {
             'Authorization': `Bearer ${token}`,
         },
+        signal: controller.signal,
     });
     const text = await res.text();
     if (!res.ok) {
@@ -847,6 +950,48 @@ async function getRunDetails(host, token, runId) {
         output.appendLine('runs/get returned response without run_id field.');
     }
     return parsed;
+}
+async function getRunOutput(host, token, runId, cancelToken) {
+    const output = getOutputChannel();
+    const searchParams = new URLSearchParams();
+    searchParams.set('run_id', runId.toString());
+    const url = `${host}/api/2.1/jobs/runs/get-output?${searchParams.toString()}`;
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
+    const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+        signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`runs/get-output failed: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
+    }
+    if (!text) {
+        return {};
+    }
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        throw new Error('runs/get-output returned invalid JSON.');
+    }
 }
 function isWrongMethodError(err) {
     return !!err.body && /post\s+\/jobs\/runs\/list/i.test(err.body);
