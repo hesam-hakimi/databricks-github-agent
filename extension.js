@@ -89,42 +89,7 @@ class DatabricksGetRunsTool {
         }
     }
     formatRuns(jobId, runs, limit, includeRawJson) {
-        const successes = runs.filter(r => (r.state?.result_state || '').toUpperCase() === 'SUCCESS').length;
-        const failures = runs.filter(r => (r.state?.result_state || '').toUpperCase() === 'FAILED').length;
-        const timestamps = runs
-            .map(r => r.start_time)
-            .filter((v) => typeof v === 'number')
-            .sort();
-        const earliest = timestamps[0] ? new Date(timestamps[0]).toISOString() : 'n/a';
-        const latest = timestamps[timestamps.length - 1] ? new Date(timestamps[timestamps.length - 1]).toISOString() : 'n/a';
-        const lines = [];
-        lines.push(`# Databricks runs for job ${jobId}`);
-        lines.push(`- runs returned: ${runs.length} (limit ${limit})`);
-        lines.push(`- time range: ${earliest} -> ${latest}`);
-        lines.push(`- successes: ${successes}, failures: ${failures}`);
-        lines.push('');
-        lines.push('| run_id | start | end | duration_s | life_cycle | result | cluster |');
-        lines.push('| --- | --- | --- | --- | --- | --- | --- |');
-        for (const run of runs) {
-            const start = run.start_time ? new Date(run.start_time).toLocaleString() : 'n/a';
-            const end = run.end_time ? new Date(run.end_time).toLocaleString() : 'n/a';
-            const durationSeconds = run.start_time && run.end_time ? ((run.end_time - run.start_time) / 1000).toFixed(1) : 'n/a';
-            const cluster = run.cluster_spec?.new_cluster
-                ? `${run.cluster_spec.new_cluster.num_workers ?? '?'}x ${run.cluster_spec.new_cluster.node_type_id ?? ''}`
-                : 'n/a';
-            lines.push(`| ${run.run_id} | ${start} | ${end} | ${durationSeconds} | ${run.state?.life_cycle_state ?? 'n/a'} | ${run.state?.result_state ?? 'n/a'} | ${cluster} |`);
-        }
-        if (includeRawJson) {
-            const truncated = runs.slice(0, Math.min(runs.length, limit));
-            lines.push('');
-            lines.push('```json');
-            lines.push(JSON.stringify(truncated, null, 2));
-            lines.push('```');
-            if (runs.length > truncated.length) {
-                lines.push(`(truncated to ${truncated.length} of ${runs.length} runs)`);
-            }
-        }
-        return lines.join('\n');
+        return formatRunsMarkdown(jobId, runs, limit, includeRawJson);
     }
 }
 class DatabricksGetJobDefinitionTool {
@@ -252,6 +217,34 @@ class DatabricksGetNotebookSourceTool {
         }
     }
 }
+class DatabricksCreateJobFromCodeTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const { jobName } = options.input;
+        const message = `Upload code and submit a Databricks run for job ${jobName}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Create & Run Job From Code',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, _token) {
+        const input = options.input;
+        try {
+            const markdown = await createJobFromCode(this.context, input);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'create and run job from code');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
 class DatabricksListClustersTool {
     context;
     constructor(context) {
@@ -315,6 +308,7 @@ function activate(context) {
     context.subscriptions.push(vscode.lm.registerTool('databricks_getRuns', tool));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_job_definition', new DatabricksGetJobDefinitionTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_notebook_source', new DatabricksGetNotebookSourceTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_create_job_from_code', new DatabricksCreateJobFromCodeTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_list_clusters', new DatabricksListClustersTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_start_cluster', new DatabricksStartClusterTool(context)));
     const viewProvider = new databricksView_1.DatabricksViewProvider(context);
@@ -514,6 +508,74 @@ function activate(context) {
             cts.dispose();
         }
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.createJobFromCode', async () => {
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            const input = await promptCreateJobFromCodeInput(client, cts.token);
+            if (!input) {
+                return;
+            }
+            const markdown = await createJobFromCode(context, input);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage('Job submitted to Databricks.');
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'create and run job from code');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.getRuns', async () => {
+        const jobIdInput = await vscode.window.showInputBox({
+            title: 'Databricks Job ID',
+            prompt: 'Enter the job ID to fetch recent runs',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim()) {
+                    return 'Job ID is required';
+                }
+                return /^\d+$/.test(value.trim()) ? null : 'Job ID must be a number';
+            },
+        });
+        if (!jobIdInput) {
+            return;
+        }
+        const limitInput = await vscode.window.showInputBox({
+            title: 'Limit (optional)',
+            prompt: 'Enter number of runs to fetch (default 20)',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim()) {
+                    return null;
+                }
+                return /^\d+$/.test(value.trim()) ? null : 'Enter a positive integer or leave empty';
+            },
+        });
+        const limit = limitInput && limitInput.trim() ? Math.max(1, Math.min(100, Number(limitInput.trim()))) : 20;
+        const jobId = Number(jobIdInput.trim());
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            const runs = await client.listRuns(jobId, limit, cts.token);
+            const markdown = formatRunsMarkdown(jobId, runs, limit, false);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage(`Fetched runs for job ${jobId}.`);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'job runs');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.openPanel', async () => {
         await vscode.commands.executeCommand('workbench.view.extension.databricksTools');
     }));
@@ -593,6 +655,144 @@ async function promptNotebookSourceInput() {
     }
     return { jobId: Number(jobId.trim()), taskKey: taskKey.trim(), maxSourceChars: parsedMax };
 }
+async function promptCreateJobFromCodeInput(client, token) {
+    const jobName = await vscode.window.showInputBox({
+        title: 'Job name',
+        prompt: 'Enter a name for the new Databricks job/run',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Job name is required'),
+    });
+    if (!jobName) {
+        return undefined;
+    }
+    const languagePick = await vscode.window.showQuickPick([
+        { label: 'PYTHON', description: 'Default', value: 'PYTHON' },
+        { label: 'SQL', value: 'SQL' },
+        { label: 'SCALA', value: 'SCALA' },
+        { label: 'R', value: 'R' },
+    ], { title: 'Language', placeHolder: 'Select code language', ignoreFocusOut: true });
+    const language = languagePick?.value ?? 'PYTHON';
+    const workspacePath = await vscode.window.showInputBox({
+        title: 'Workspace path (optional)',
+        prompt: 'Provide a workspace path or leave empty to use the default folder',
+        ignoreFocusOut: true,
+    });
+    const sourceCode = await vscode.window.showInputBox({
+        title: 'Source code',
+        prompt: 'Paste the Python/SQL code to upload and run',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Source code is required'),
+        value: '',
+    });
+    if (!sourceCode) {
+        return undefined;
+    }
+    const clusterModePick = await vscode.window.showQuickPick([
+        { label: 'Use existing cluster', value: 'existingCluster' },
+        { label: 'Create new job cluster', value: 'newJobCluster' },
+    ], { title: 'Cluster selection', placeHolder: 'Choose how to run the job', ignoreFocusOut: true });
+    if (!clusterModePick) {
+        return undefined;
+    }
+    if (clusterModePick.value === 'existingCluster') {
+        let clusters = [];
+        try {
+            clusters = await client.listClusters(token);
+        }
+        catch {
+            // ignore list errors here; user can still enter manually
+        }
+        const items = clusters.slice(0, 50).map(c => ({
+            label: c.cluster_name ?? c.cluster_id ?? 'unknown cluster',
+            description: c.cluster_id ?? '',
+            detail: `state: ${c.state ?? 'n/a'}`,
+            clusterId: c.cluster_id,
+        }));
+        items.push({ label: 'Enter cluster ID manually…', description: 'Type an existing cluster ID', detail: '', clusterId: undefined });
+        const pick = await vscode.window.showQuickPick(items, {
+            title: 'Select existing cluster',
+            placeHolder: 'Choose a cluster to run the job',
+            ignoreFocusOut: true,
+        });
+        if (!pick) {
+            return undefined;
+        }
+        let clusterId = pick.clusterId;
+        if (!clusterId) {
+            const manual = await vscode.window.showInputBox({
+                title: 'Existing cluster ID',
+                prompt: 'Enter the cluster ID to use',
+                ignoreFocusOut: true,
+                validateInput: value => (value.trim() ? null : 'Cluster ID is required'),
+            });
+            if (!manual) {
+                return undefined;
+            }
+            clusterId = manual.trim();
+        }
+        return {
+            jobName: jobName.trim(),
+            sourceCode,
+            language,
+            workspacePath: workspacePath?.trim() || undefined,
+            clusterMode: 'existingCluster',
+            existingClusterId: clusterId,
+        };
+    }
+    const sparkVersion = await vscode.window.showInputBox({
+        title: 'Runtime version',
+        prompt: 'Enter Databricks runtime version, e.g. 14.3.x-scala2.12',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Runtime version is required'),
+    });
+    if (!sparkVersion) {
+        return undefined;
+    }
+    const nodeTypeId = await vscode.window.showInputBox({
+        title: 'Node type',
+        prompt: 'Enter node_type_id for workers/driver',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Node type is required'),
+    });
+    if (!nodeTypeId) {
+        return undefined;
+    }
+    const numWorkersInput = await vscode.window.showInputBox({
+        title: 'Number of workers (optional)',
+        prompt: 'Enter worker count (default 1)',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return null;
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Enter a non-negative integer or leave empty';
+        },
+    });
+    const autoTermInput = await vscode.window.showInputBox({
+        title: 'Auto-termination minutes (optional)',
+        prompt: 'Enter auto-termination in minutes (default 60)',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return null;
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Enter a non-negative integer or leave empty';
+        },
+    });
+    return {
+        jobName: jobName.trim(),
+        sourceCode,
+        language,
+        workspacePath: workspacePath?.trim() || undefined,
+        clusterMode: 'newJobCluster',
+        newClusterConfig: {
+            sparkVersion: sparkVersion.trim(),
+            nodeTypeId: nodeTypeId.trim(),
+            numWorkers: parseOptionalPositiveInt(numWorkersInput),
+            autoTerminationMinutes: parseOptionalPositiveInt(autoTermInput),
+        },
+    };
+}
 function parseOptionalPositiveInt(value) {
     if (!value) {
         return undefined;
@@ -606,6 +806,40 @@ function parseOptionalPositiveInt(value) {
         return undefined;
     }
     return Math.floor(parsed);
+}
+async function createJobFromCode(context, input) {
+    const jobName = input.jobName?.trim();
+    const sourceCode = input.sourceCode;
+    if (!jobName || !sourceCode) {
+        throw new Error('jobName and sourceCode are required to create and run a job.');
+    }
+    const language = (input.language ?? 'PYTHON').toUpperCase();
+    const clusterMode = input.clusterMode === 'newJobCluster' ? 'newJobCluster' : 'existingCluster';
+    if (clusterMode === 'existingCluster' && !input.existingClusterId) {
+        throw new Error('existingClusterId is required when clusterMode is existingCluster.');
+    }
+    let newClusterConfig;
+    if (clusterMode === 'newJobCluster') {
+        const cfg = input.newClusterConfig;
+        if (!cfg || !cfg.sparkVersion || !cfg.nodeTypeId) {
+            throw new Error('newClusterConfig.sparkVersion and nodeTypeId are required when clusterMode is newJobCluster.');
+        }
+        newClusterConfig = {
+            sparkVersion: cfg.sparkVersion,
+            nodeTypeId: cfg.nodeTypeId,
+            numWorkers: normalizeOptionalInt(cfg.numWorkers, 1),
+            autoTerminationMinutes: normalizeOptionalInt(cfg.autoTerminationMinutes, 60),
+        };
+    }
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const defaultFolder = getDefaultUploadFolder();
+    const targetPath = buildWorkspaceUploadPath(jobName, language, input.workspacePath, defaultFolder);
+    await client.importWorkspaceSource(targetPath, language, sourceCode);
+    const result = await client.submitRunFromNotebook(jobName, targetPath, clusterMode, {
+        existingClusterId: input.existingClusterId,
+        newClusterConfig,
+    });
+    return formatCreateJobResult(jobName, targetPath, clusterMode, input.existingClusterId, newClusterConfig, result);
 }
 async function fetchTaskSources(client, tasks, maxSourceCharsPerTask, token) {
     const results = [];
@@ -720,6 +954,28 @@ function formatNotebookSource(path, language, source, truncated, maxSourceChars)
     }
     return lines.join('\n');
 }
+function formatCreateJobResult(jobName, path, clusterMode, existingClusterId, newClusterConfig, result) {
+    const lines = [];
+    lines.push('## Job submitted to Databricks');
+    lines.push('');
+    lines.push(`Run ID: \`${result.runId}\``);
+    if (result.jobId !== undefined) {
+        lines.push(`Job ID: \`${result.jobId}\``);
+    }
+    lines.push(`Run name: \`${jobName}\``);
+    lines.push(`Notebook path: \`${path}\``);
+    if (clusterMode === 'existingCluster') {
+        lines.push(`Cluster mode: existingCluster (id: ${existingClusterId ?? 'n/a'})`);
+    }
+    else if (newClusterConfig) {
+        lines.push(`Cluster mode: newJobCluster (runtime ${newClusterConfig.sparkVersion}, node ${newClusterConfig.nodeTypeId}, workers ${newClusterConfig.numWorkers ?? 1}, auto-term ${newClusterConfig.autoTerminationMinutes ?? 60}m)`);
+    }
+    lines.push('');
+    lines.push('You can now:');
+    lines.push('- Ask me to monitor this run with `getDatabricksRuns` by providing the job/run details.');
+    lines.push('- Open the run in the Databricks UI if you prefer (use the run ID above).');
+    return lines.join('\n');
+}
 function formatWorkspaceExportError(path, err) {
     if (err instanceof databricksClient_1.ApiError) {
         const status = err.status ?? 'unknown';
@@ -739,6 +995,95 @@ function formatNotebookPathResolutionError(jobId, taskKey, err) {
     }
     const message = err instanceof Error ? err.message : String(err);
     return message;
+}
+function formatRunsMarkdown(jobId, runs, limit, includeRawJson) {
+    const successes = runs.filter(r => (r.state?.result_state || '').toUpperCase() === 'SUCCESS').length;
+    const failures = runs.filter(r => (r.state?.result_state || '').toUpperCase() === 'FAILED').length;
+    const timestamps = runs
+        .map(r => r.start_time)
+        .filter((v) => typeof v === 'number')
+        .sort();
+    const earliest = timestamps[0] ? new Date(timestamps[0]).toISOString() : 'n/a';
+    const latest = timestamps[timestamps.length - 1] ? new Date(timestamps[timestamps.length - 1]).toISOString() : 'n/a';
+    const lines = [];
+    lines.push(`# Databricks runs for job ${jobId}`);
+    lines.push(`- runs returned: ${runs.length} (limit ${limit})`);
+    lines.push(`- time range: ${earliest} -> ${latest}`);
+    lines.push(`- successes: ${successes}, failures: ${failures}`);
+    lines.push('');
+    lines.push('| run_id | start | end | duration_s | life_cycle | result | cluster |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+    for (const run of runs) {
+        const start = run.start_time ? new Date(run.start_time).toLocaleString() : 'n/a';
+        const end = run.end_time ? new Date(run.end_time).toLocaleString() : 'n/a';
+        const durationSeconds = run.start_time && run.end_time ? ((run.end_time - run.start_time) / 1000).toFixed(1) : 'n/a';
+        const cluster = run.cluster_spec?.new_cluster
+            ? `${run.cluster_spec.new_cluster.num_workers ?? '?'}x ${run.cluster_spec.new_cluster.node_type_id ?? ''}`
+            : 'n/a';
+        lines.push(`| ${run.run_id} | ${start} | ${end} | ${durationSeconds} | ${run.state?.life_cycle_state ?? 'n/a'} | ${run.state?.result_state ?? 'n/a'} | ${cluster} |`);
+    }
+    if (includeRawJson) {
+        const truncated = runs.slice(0, Math.min(runs.length, limit));
+        lines.push('');
+        lines.push('```json');
+        lines.push(JSON.stringify(truncated, null, 2));
+        lines.push('```');
+        if (runs.length > truncated.length) {
+            lines.push(`(truncated to ${truncated.length} of ${runs.length} runs)`);
+        }
+    }
+    return lines.join('\n');
+}
+function getDefaultUploadFolder() {
+    const cfg = vscode.workspace.getConfiguration('databricksTools');
+    const folder = (cfg.get('defaultUploadFolder') || '/Workspace/Shared/CopilotJobs').trim();
+    return folder || '/Workspace/Shared/CopilotJobs';
+}
+function buildWorkspaceUploadPath(jobName, language, explicitPath, defaultFolder) {
+    if (explicitPath && explicitPath.trim()) {
+        return explicitPath.trim();
+    }
+    const ext = languageToExtension(language);
+    const safeName = sanitizeName(jobName || 'job');
+    const timestamp = formatTimestamp(new Date());
+    const baseFolder = defaultFolder.replace(/\/$/, '');
+    return `${baseFolder}/${safeName}-${timestamp}.${ext}`;
+}
+function sanitizeName(name) {
+    return name.trim().toLowerCase().replace(/[^a-z0-9-_]+/g, '-').replace(/^-+|-+$/g, '') || 'job';
+}
+function formatTimestamp(d) {
+    const pad = (n) => n.toString().padStart(2, '0');
+    const yyyy = d.getFullYear();
+    const mm = pad(d.getMonth() + 1);
+    const dd = pad(d.getDate());
+    const hh = pad(d.getHours());
+    const mi = pad(d.getMinutes());
+    const ss = pad(d.getSeconds());
+    return `${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
+}
+function languageToExtension(language) {
+    const normalized = (language || '').toUpperCase();
+    switch (normalized) {
+        case 'SQL':
+            return 'sql';
+        case 'SCALA':
+            return 'scala';
+        case 'R':
+            return 'r';
+        default:
+            return 'py';
+    }
+}
+function normalizeOptionalInt(value, fallback) {
+    if (value === undefined || value === null) {
+        return fallback;
+    }
+    if (!Number.isFinite(value)) {
+        return fallback;
+    }
+    const n = Math.floor(value);
+    return n >= 0 ? n : fallback;
 }
 function formatDatabricksError(err, context) {
     if (err instanceof databricksClient_1.ConfigCancelled) {

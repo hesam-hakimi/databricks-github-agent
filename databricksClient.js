@@ -40,6 +40,8 @@ exports.clearStoredCredentials = clearStoredCredentials;
 exports.setAuthMode = setAuthMode;
 exports.getAuthStatus = getAuthStatus;
 exports.exportWorkspaceSource = exportWorkspaceSource;
+exports.importWorkspaceSource = importWorkspaceSource;
+exports.submitRunFromNotebook = submitRunFromNotebook;
 exports.getOutputChannel = getOutputChannel;
 const vscode = __importStar(require("vscode"));
 const util_1 = require("util");
@@ -129,6 +131,12 @@ class DatabricksClient {
     }
     async exportWorkspaceSource(path) {
         return exportWorkspaceSource(this.host, this.token, path);
+    }
+    async importWorkspaceSource(path, language, sourceCode) {
+        return importWorkspaceSource(this.host, this.token, path, language, sourceCode);
+    }
+    async submitRunFromNotebook(runName, notebookPath, clusterMode, options) {
+        return submitRunFromNotebook(this.host, this.token, runName, notebookPath, clusterMode, options);
     }
     async callJobsRunsList(params, version, token) {
         const controller = new AbortController();
@@ -490,6 +498,110 @@ async function exportWorkspaceSource(host, token, path) {
         throw new Error('Failed to decode workspace export content from base64.');
     }
     return { language: parsed.language, source: decoded };
+}
+async function importWorkspaceSource(host, token, path, language, sourceCode) {
+    const output = getOutputChannel();
+    const url = `${host}/api/2.0/workspace/import`;
+    const payload = {
+        path,
+        format: 'SOURCE',
+        language,
+        content: Buffer.from(sourceCode, 'utf8').toString('base64'),
+        overwrite: true,
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`Workspace import failed for path ${path}: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.0', text || message, errCode);
+    }
+}
+async function submitRunFromNotebook(host, token, runName, notebookPath, clusterMode, options) {
+    const output = getOutputChannel();
+    const url = `${host}/api/2.1/jobs/runs/submit`;
+    const task = {
+        task_key: 'main',
+        notebook_task: { notebook_path: notebookPath },
+    };
+    if (clusterMode === 'existingCluster') {
+        if (!options.existingClusterId) {
+            throw new Error('existingClusterId is required when clusterMode is existingCluster.');
+        }
+        task.existing_cluster_id = options.existingClusterId;
+    }
+    else {
+        const cfg = options.newClusterConfig;
+        if (!cfg || !cfg.sparkVersion || !cfg.nodeTypeId) {
+            throw new Error('newClusterConfig.sparkVersion and nodeTypeId are required when clusterMode is newJobCluster.');
+        }
+        task.new_cluster = {
+            spark_version: cfg.sparkVersion,
+            node_type_id: cfg.nodeTypeId,
+            num_workers: cfg.numWorkers ?? 1,
+            autotermination_minutes: cfg.autoTerminationMinutes ?? 60,
+        };
+    }
+    const payload = {
+        run_name: runName,
+        tasks: [task],
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore JSON parsing issues
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`runs/submit failed: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
+    }
+    let parsed = {};
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new Error('runs/submit returned invalid JSON.');
+    }
+    if (!parsed.run_id) {
+        throw new Error('runs/submit did not return run_id.');
+    }
+    return { runId: parsed.run_id, jobId: parsed.job_id };
 }
 function isWrongMethodError(err) {
     return !!err.body && /post\s+\/jobs\/runs\/list/i.test(err.body);
