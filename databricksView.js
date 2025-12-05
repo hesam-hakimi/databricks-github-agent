@@ -167,6 +167,11 @@ class DatabricksViewProvider {
                 icon: 'rocket',
             }),
             new SimpleTreeItem({
+                label: 'Run Code and Get Result…',
+                command: { command: 'databricksTools.runCodeAndGetResult', title: 'Run Code and Get Result' },
+                icon: 'beaker',
+            }),
+            new SimpleTreeItem({
                 label: 'Get Job Runs…',
                 command: { command: 'databricksTools.getRuns', title: 'Get Job Runs' },
                 icon: 'list-ordered',

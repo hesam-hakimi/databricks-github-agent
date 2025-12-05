@@ -7,30 +7,31 @@ exports.normalizeCandidateWorkspaceFolder = normalizeCandidateWorkspaceFolder;
 exports.sanitizeName = sanitizeName;
 exports.formatTimestamp = formatTimestamp;
 exports.languageToExtension = languageToExtension;
+exports.capJsonString = capJsonString;
+const buffer_1 = require("buffer");
 exports.DEFAULT_WORKSPACE_FOLDER = '/Workspace/Shared/CopilotJobs';
 function computeUploadWorkspacePath(options) {
     const { explicitWorkspacePath, jobName, language, defaultWorkspaceFolder, appendProjectSubfolder = false, projectName, now, } = options;
     const ext = languageToExtension(language);
     const safeJob = sanitizeName(jobName || 'job');
     const timestamp = formatTimestamp(now ?? new Date());
-    if (explicitWorkspacePath && explicitWorkspacePath.trim()) {
-        const trimmed = explicitWorkspacePath.trim();
-        const isFile = /\.(py|sql|scala|r)$/i.test(trimmed);
-        if (isFile) {
-            return trimmed;
+    const explicit = explicitWorkspacePath?.trim();
+    if (explicit) {
+        if (isWorkspaceFilePath(explicit)) {
+            return explicit;
         }
-        const base = trimTrailingSlash(trimmed);
-        return `${base}/${safeJob}-${timestamp}.${ext}`;
+        const normalizedFolder = normalizeCandidateWorkspaceFolder(explicit);
+        if (normalizedFolder) {
+            return `${normalizedFolder}/${safeJob}-${timestamp}.${ext}`;
+        }
     }
-    const normalizedDefault = normalizeWorkspaceFolder(defaultWorkspaceFolder);
-    const baseFolder = appendProjectSubfolder
-        ? `${normalizedDefault}/${sanitizeName(projectName || 'default-project')}`
-        : normalizedDefault;
-    return `${baseFolder}/${safeJob}-${timestamp}.${ext}`;
+    const baseDefault = ensureBaseFolder(defaultWorkspaceFolder);
+    const project = appendProjectSubfolder ? sanitizeName(projectName || '') : '';
+    const base = project ? `${baseDefault}/${project}` : baseDefault;
+    return `${base}/${safeJob}-${timestamp}.${ext}`;
 }
 function normalizeWorkspaceFolder(folder) {
-    const normalized = normalizeCandidateWorkspaceFolder(folder);
-    return normalized ?? exports.DEFAULT_WORKSPACE_FOLDER;
+    return ensureBaseFolder(folder);
 }
 function normalizeCandidateWorkspaceFolder(folder) {
     if (!folder) {
@@ -41,6 +42,9 @@ function normalizeCandidateWorkspaceFolder(folder) {
         return undefined;
     }
     if (!trimmed.startsWith('/Workspace/')) {
+        return undefined;
+    }
+    if (isWorkspaceFilePath(trimmed)) {
         return undefined;
     }
     const withoutTrailing = trimTrailingSlash(trimmed);
@@ -75,5 +79,29 @@ function languageToExtension(language) {
 }
 function trimTrailingSlash(path) {
     return path.replace(/\/+$/, '');
+}
+function isWorkspaceFilePath(path) {
+    if (!path.startsWith('/')) {
+        return false;
+    }
+    if (/^[a-z]+:\/\//i.test(path)) {
+        return false;
+    }
+    return /\.(py|sql|scala|r)$/i.test(path);
+}
+function ensureBaseFolder(base) {
+    const normalized = normalizeCandidateWorkspaceFolder(base);
+    return normalized ?? exports.DEFAULT_WORKSPACE_FOLDER;
+}
+function capJsonString(jsonString, maxBytes) {
+    if (!maxBytes || maxBytes <= 0) {
+        return { text: jsonString, truncated: false };
+    }
+    const buf = buffer_1.Buffer.from(jsonString, 'utf8');
+    if (buf.byteLength <= maxBytes) {
+        return { text: jsonString, truncated: false };
+    }
+    const truncated = buf.subarray(0, maxBytes);
+    return { text: truncated.toString('utf8'), truncated: true };
 }
 //# sourceMappingURL=workspacePath.js.map

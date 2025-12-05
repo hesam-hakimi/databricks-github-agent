@@ -52,6 +52,7 @@ exports.importWorkspaceSource = importWorkspaceSource;
 exports.createJobFromNotebook = createJobFromNotebook;
 exports.runJobNow = runJobNow;
 exports.submitNotebookRun = submitNotebookRun;
+exports.submitSingleTaskRun = submitSingleTaskRun;
 exports.ensureClusterRunning = ensureClusterRunning;
 exports.getRunDetails = getRunDetails;
 exports.getRunOutput = getRunOutput;
@@ -194,6 +195,9 @@ class DatabricksClient {
     }
     async runJobNow(jobId) {
         return runJobNow(this.host, this.token, jobId);
+    }
+    async submitSingleTaskRun(args, cancelToken) {
+        return submitSingleTaskRun(this.host, this.token, args, cancelToken);
     }
     async getRunDetails(runId, cancelToken) {
         return getRunDetails(this.host, this.token, runId, cancelToken);
@@ -800,6 +804,68 @@ async function submitNotebookRun(host, token, args, cancelToken) {
         }
         const suffix = errCode ? ` ${errCode}` : '';
         output.appendLine(`jobs/runs/submit failed: HTTP ${res.status}${suffix} ${message}`);
+        throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
+    }
+    let parsed = {};
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new Error('jobs/runs/submit returned invalid JSON.');
+    }
+    if (!parsed.run_id) {
+        throw new Error('jobs/runs/submit did not return run_id.');
+    }
+    return { runId: parsed.run_id };
+}
+async function submitSingleTaskRun(host, token, args, cancelToken) {
+    const output = getOutputChannel();
+    const url = `${host}/api/2.1/jobs/runs/submit`;
+    const payload = {
+        run_name: args.runName,
+        notebook_task: {
+            notebook_path: args.notebookPath,
+            base_parameters: args.baseParameters ?? {},
+        },
+    };
+    if (args.cluster.type === 'existing') {
+        payload.existing_cluster_id = args.cluster.id;
+    }
+    else {
+        payload.new_cluster = {
+            spark_version: args.cluster.config.sparkVersion,
+            node_type_id: args.cluster.config.nodeTypeId,
+            num_workers: args.cluster.config.numWorkers ?? 1,
+            autotermination_minutes: args.cluster.config.autoTerminationMinutes ?? 60,
+        };
+    }
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        let errCode;
+        let message = text || res.statusText;
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            errCode = parsed.error_code;
+            if (parsed.message) {
+                message = parsed.message;
+            }
+        }
+        catch {
+            // ignore
+        }
+        const suffix = errCode ? ` ${errCode}` : '';
+        output.appendLine(`jobs/runs/submit (single-task) failed: HTTP ${res.status}${suffix} ${message}`);
         throw new ApiError(`HTTP ${res.status}${suffix}: ${message || res.statusText}`.trim(), res.status, '2.1', text || message, errCode);
     }
     let parsed = {};

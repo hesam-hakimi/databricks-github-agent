@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 exports.createAndRunJobFromCode = createAndRunJobFromCode;
+exports.runCodeAndGetResult = runCodeAndGetResult;
 const vscode = __importStar(require("vscode"));
 const databricksClient_1 = require("./databricksClient");
 const databricksView_1 = require("./databricksView");
@@ -178,6 +179,39 @@ class DatabricksProfileTableLayoutTool {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'table layout profiling');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksRunCodeAndGetResultTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const jobName = options.input.jobName?.trim() || 'Ad hoc code run';
+        const clusterMode = options.input.clusterMode ?? 'defaultCluster';
+        const clusterTarget = clusterMode === 'newJobCluster'
+            ? 'a new job cluster'
+            : clusterMode === 'existingCluster'
+                ? 'the specified existing cluster'
+                : 'the default cluster (auto-start if needed)';
+        const message = `Upload code, run it as a Databricks notebook, and return JSON output for ${jobName} on ${clusterTarget}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Run Code and Get Result',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await runCodeAndGetResult(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run code and get result');
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
         }
     }
@@ -415,6 +449,7 @@ class DatabricksStartClusterTool {
 function activate(context) {
     const tool = new DatabricksGetRunsTool(context);
     context.subscriptions.push(vscode.lm.registerTool('databricks_getRuns', tool));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_run_code_and_get_result', new DatabricksRunCodeAndGetResultTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_job_definition', new DatabricksGetJobDefinitionTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_notebook_source', new DatabricksGetNotebookSourceTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_create_and_run_job_from_code', new DatabricksCreateAndRunJobFromCodeTool(context)));
@@ -889,6 +924,49 @@ function activate(context) {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'table layout profiling');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.runCodeAndGetResult', async () => {
+        const editor = vscode.window.activeTextEditor;
+        const selection = editor?.selection && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : undefined;
+        const source = selection || editor?.document.getText() || '';
+        if (!source.trim()) {
+            void vscode.window.showErrorMessage('No code to run. Open a file or select code before running.');
+            return;
+        }
+        const languageId = editor?.document.languageId?.toLowerCase() ?? 'python';
+        const language = languageId === 'sql'
+            ? 'SQL'
+            : languageId === 'scala'
+                ? 'SCALA'
+                : languageId === 'r'
+                    ? 'R'
+                    : 'PYTHON';
+        if (language !== 'PYTHON') {
+            void vscode.window.showErrorMessage('Only PYTHON code is supported for returning JSON results.');
+            return;
+        }
+        const fileName = editor?.document.uri ? vscode.workspace.asRelativePath(editor.document.uri) : undefined;
+        const jobName = fileName ? `Run ${fileName}` : 'Ad hoc code run';
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await runCodeAndGetResult(context, {
+                jobName,
+                sourceCode: source,
+                language,
+                clusterMode: 'defaultCluster',
+            }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage('Databricks run completed.');
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run code and get result');
             void vscode.window.showErrorMessage(message);
         }
         finally {
@@ -1455,6 +1533,116 @@ async function createAndRunJobFromCode(context, input, token) {
     const { runId } = await client.runJobNow(jobId);
     return formatCreateAndRunJobResult(jobId, runId, jobName, targetPath, clusterInfo, newClusterConfig);
 }
+async function runCodeAndGetResult(context, input, token) {
+    const jobName = input.jobName?.trim() || 'Ad hoc code run';
+    const sourceCode = input.sourceCode;
+    if (!sourceCode?.trim()) {
+        throw new Error('sourceCode is required to run code.');
+    }
+    const language = (input.language ?? 'PYTHON').toUpperCase();
+    if (language !== 'PYTHON') {
+        throw new Error('runCodeAndGetResult currently supports only PYTHON.');
+    }
+    const maxRows = normalizeRowLimit(input.maxRows);
+    const requestedClusterMode = input.clusterMode ?? 'defaultCluster';
+    const effectiveToken = token ?? new vscode.CancellationTokenSource().token;
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    let newClusterConfig;
+    let clusterInfo = { mode: requestedClusterMode };
+    let clusterModeForJob;
+    let existingClusterId = input.existingClusterId;
+    if (requestedClusterMode === 'newJobCluster') {
+        const cfg = input.newClusterConfig;
+        if (!cfg || !cfg.sparkVersion || !cfg.nodeTypeId) {
+            throw new Error('newClusterConfig.sparkVersion and nodeTypeId are required when clusterMode is newJobCluster.');
+        }
+        newClusterConfig = {
+            sparkVersion: cfg.sparkVersion,
+            nodeTypeId: cfg.nodeTypeId,
+            numWorkers: normalizeOptionalInt(cfg.numWorkers, 1),
+            autoTerminationMinutes: normalizeOptionalInt(cfg.autoTerminationMinutes, 60),
+        };
+        clusterModeForJob = 'newJobCluster';
+    }
+    else {
+        const resolved = await resolveClusterForExecution(context, client, requestedClusterMode, existingClusterId, effectiveToken);
+        clusterModeForJob = 'existingCluster';
+        existingClusterId = resolved.clusterId;
+        clusterInfo = {
+            mode: requestedClusterMode,
+            clusterId: resolved.clusterId,
+            clusterName: resolved.clusterName,
+            clusterSource: resolved.clusterSource,
+            initialState: resolved.initialState,
+            finalState: resolved.finalState,
+            autoStarted: resolved.autoStarted,
+        };
+    }
+    const uploadSettings = (0, databricksClient_1.getWorkspaceUploadSettings)();
+    const projectName = vscode.workspace.workspaceFolders?.[0]?.name;
+    const targetPath = (0, workspacePath_1.computeUploadWorkspacePath)({
+        explicitWorkspacePath: input.workspacePath,
+        jobName,
+        language,
+        defaultWorkspaceFolder: uploadSettings.folder,
+        appendProjectSubfolder: uploadSettings.appendProjectSubfolder,
+        projectName,
+    });
+    const wrappedSource = buildResultNotebookSource(sourceCode, { maxRows });
+    await client.importWorkspaceSource(targetPath, language, wrappedSource);
+    const runSubmission = await client.submitSingleTaskRun({
+        runName: jobName,
+        notebookPath: targetPath,
+        cluster: clusterModeForJob === 'existingCluster'
+            ? { type: 'existing', id: existingClusterId }
+            : { type: 'new', config: newClusterConfig },
+    }, effectiveToken);
+    const runId = runSubmission.runId;
+    const runDetails = await waitForRunCompletion(client, runId, effectiveToken, {
+        pollIntervalMs: 5000,
+        timeoutMs: 15 * 60 * 1000,
+    });
+    if (!clusterInfo.clusterId && runDetails.cluster_instance?.cluster_id) {
+        clusterInfo = {
+            ...clusterInfo,
+            clusterId: runDetails.cluster_instance.cluster_id,
+        };
+    }
+    const output = await client.getRunOutput(runId, effectiveToken);
+    const raw = output.notebook_output?.result ?? output.notebook_output?.error ?? output.error ?? output.error_trace;
+    if (!raw) {
+        return formatRunResultMarkdown({
+            runId,
+            jobName,
+            path: targetPath,
+            clusterInfo,
+            resultJson: undefined,
+            rawText: undefined,
+            truncated: false,
+            rowLimit: maxRows,
+        });
+    }
+    const limited = (0, workspacePath_1.capJsonString)(raw, input.maxResultBytes);
+    let parsed;
+    let parseError;
+    try {
+        parsed = JSON.parse(limited.text);
+    }
+    catch (err) {
+        parseError = err instanceof Error ? err.message : String(err);
+    }
+    return formatRunResultMarkdown({
+        runId,
+        jobName,
+        path: targetPath,
+        clusterInfo,
+        resultJson: parsed,
+        rawText: parseError ? limited.text : undefined,
+        truncated: limited.truncated,
+        parseError,
+        rowLimit: maxRows,
+    });
+}
 const TABLE_PROFILE_NOTEBOOK_SOURCE = [
     '# Databricks table layout profiler',
     'import json',
@@ -1851,6 +2039,104 @@ function formatCreateAndRunJobResult(jobId, runId, jobName, path, clusterInfo, n
     lines.push('- Re-run the job later via Databricks UI using the job ID above.');
     return lines.join('\n');
 }
+function buildResultNotebookSource(userCode, options) {
+    const rowLimit = normalizeRowLimit(options.maxRows);
+    const lines = [];
+    lines.push('import json');
+    lines.push('import traceback');
+    lines.push(`_MAX_ROWS = ${rowLimit}`);
+    lines.push('result = None');
+    lines.push('# --- User code start ---');
+    lines.push(userCode);
+    lines.push('# --- User code end ---');
+    lines.push('');
+    lines.push('def _default_serializer(obj):');
+    lines.push('    try:');
+    lines.push('        from pyspark.sql import DataFrame');
+    lines.push('        if isinstance(obj, DataFrame):');
+    lines.push('            try:');
+    lines.push('                sample = obj.limit(_MAX_ROWS)');
+    lines.push('                rows = [json.loads(r) for r in sample.toJSON().take(_MAX_ROWS)]');
+    lines.push("                return {'type': 'pyspark.sql.DataFrame', 'rows': rows, 'rowLimit': _MAX_ROWS}");
+    lines.push('            except Exception as e:');
+    lines.push("                return {'type': 'pyspark.sql.DataFrame', 'error': f'sampling failed: {e}'}");
+    lines.push('    except Exception:');
+    lines.push('        pass');
+    lines.push('    try:');
+    lines.push('        import pandas as pd');
+    lines.push('        if isinstance(obj, pd.DataFrame):');
+    lines.push("            return {'type': 'pandas.DataFrame', 'rows': json.loads(pd.DataFrame(obj.head(_MAX_ROWS)).to_json(orient='records')), 'rowLimit': _MAX_ROWS}");
+    lines.push('    except Exception:');
+    lines.push('        pass');
+    lines.push('    try:');
+    lines.push('        if hasattr(obj, "__dict__"):');
+    lines.push('            return obj.__dict__');
+    lines.push('    except Exception:');
+    lines.push('        pass');
+    lines.push('    return str(obj)');
+    lines.push('');
+    lines.push('try:');
+    lines.push('    payload = json.dumps(result, default=_default_serializer)');
+    lines.push('except Exception as e:');
+    lines.push("    dbutils.notebook.exit(json.dumps({'error': f'Failed to serialize result: {e}'}))");
+    lines.push('else:');
+    lines.push('    dbutils.notebook.exit(payload)');
+    return lines.join('\n');
+}
+function formatRunResultMarkdown(args) {
+    const lines = [];
+    lines.push('## Databricks Run Result');
+    lines.push('');
+    if (args.jobId !== undefined) {
+        lines.push(`Job ID: \`${args.jobId}\``);
+    }
+    else {
+        lines.push('Job ID: one-off run (runs/submit)');
+    }
+    lines.push(`Run ID: \`${args.runId}\``);
+    lines.push(`Run name: \`${args.jobName}\``);
+    lines.push(`Workspace path: \`${args.path}\``);
+    if (args.clusterInfo.clusterId) {
+        const label = args.clusterInfo.mode === 'defaultCluster' ? 'default cluster' : args.clusterInfo.mode;
+        const autoNote = args.clusterInfo.autoStarted ? ' (auto-started if needed)' : '';
+        lines.push(`Cluster: ${label} \`${args.clusterInfo.clusterId}\`${autoNote}`);
+    }
+    if (args.clusterInfo.finalState) {
+        lines.push(`Cluster final state: ${args.clusterInfo.finalState}`);
+    }
+    if (args.rowLimit) {
+        lines.push(`Row sampling limit: ${args.rowLimit}`);
+    }
+    lines.push('');
+    lines.push('**Result (JSON)**');
+    lines.push('');
+    if (args.resultJson !== undefined) {
+        lines.push('```json');
+        lines.push(JSON.stringify(args.resultJson, null, 2));
+        lines.push('```');
+    }
+    else if (args.rawText) {
+        lines.push('```');
+        lines.push(args.rawText);
+        lines.push('```');
+        if (args.parseError) {
+            lines.push('');
+            lines.push(`(Could not parse JSON: ${args.parseError})`);
+        }
+    }
+    else {
+        lines.push('_No result returned from run output._');
+    }
+    if (args.truncated) {
+        lines.push('');
+        lines.push('_Result truncated due to maxResultBytes limit._');
+    }
+    lines.push('');
+    lines.push('You can now:');
+    lines.push('- Ask for run details or logs with the run ID above.');
+    lines.push('- Re-run or extend this code by modifying the source and running again.');
+    return lines.join('\n');
+}
 function formatWorkspaceExportError(path, err) {
     if (err instanceof databricksClient_1.ApiError) {
         const status = err.status ?? 'unknown';
@@ -1959,6 +2245,17 @@ function normalizeOptionalInt(value, fallback) {
     }
     const n = Math.floor(value);
     return n >= 0 ? n : fallback;
+}
+function normalizeRowLimit(value) {
+    const fallback = 20;
+    if (value === undefined || value === null) {
+        return fallback;
+    }
+    if (!Number.isFinite(value)) {
+        return fallback;
+    }
+    const n = Math.max(1, Math.floor(value));
+    return Math.min(n, 1000);
 }
 function formatDatabricksError(err, context) {
     if (err instanceof databricksClient_1.ConfigCancelled) {
