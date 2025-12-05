@@ -77,6 +77,7 @@ class DatabricksViewProvider {
             return element.children;
         }
         const status = await (0, databricksClient_1.getAuthStatus)(this.context);
+        const defaultCluster = await (0, databricksClient_1.getDefaultCluster)(this.context);
         const connectionItems = [
             new SimpleTreeItem({
                 label: this.lastConnectionStatus ? `Status: ${this.lastConnectionStatus}` : 'Status: Not tested',
@@ -116,6 +117,14 @@ class DatabricksViewProvider {
                 label: 'Configure Connection',
                 command: { command: 'databricksTools.configure', title: 'Configure Connection' },
                 icon: 'gear',
+            }),
+            new SimpleTreeItem({
+                label: defaultCluster.id
+                    ? `Default cluster: ${defaultCluster.name ?? defaultCluster.id}`
+                    : 'Default cluster: not set',
+                description: defaultCluster.id ? defaultCluster.id : undefined,
+                command: { command: 'databricksTools.setDefaultCluster', title: 'Select Default Cluster' },
+                icon: defaultCluster.id ? 'server' : 'warning',
             }),
             new SimpleTreeItem({
                 label: 'Switch Auth Mode',

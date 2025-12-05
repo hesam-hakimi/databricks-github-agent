@@ -36,6 +36,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ApiError = exports.DatabricksClient = exports.ConfigCancelled = void 0;
 exports.ensureDatabricksConfig = ensureDatabricksConfig;
 exports.configureConnection = configureConnection;
+exports.getDefaultCluster = getDefaultCluster;
+exports.setDefaultCluster = setDefaultCluster;
+exports.clearDefaultCluster = clearDefaultCluster;
 exports.clearStoredCredentials = clearStoredCredentials;
 exports.setAuthMode = setAuthMode;
 exports.getAuthStatus = getAuthStatus;
@@ -43,6 +46,7 @@ exports.exportWorkspaceSource = exportWorkspaceSource;
 exports.importWorkspaceSource = importWorkspaceSource;
 exports.createJobFromNotebook = createJobFromNotebook;
 exports.runJobNow = runJobNow;
+exports.ensureClusterRunning = ensureClusterRunning;
 exports.getRunDetails = getRunDetails;
 exports.getOutputChannel = getOutputChannel;
 const vscode = __importStar(require("vscode"));
@@ -117,6 +121,39 @@ class DatabricksClient {
         }
         return clusters;
     }
+    async getCluster(clusterId) {
+        const searchParams = new URLSearchParams();
+        searchParams.set('cluster_id', clusterId);
+        const url = `${this.host}/api/2.0/clusters/get?${searchParams.toString()}`;
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+            },
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            let code;
+            let message = text || res.statusText;
+            try {
+                const parsed = text ? JSON.parse(text) : {};
+                code = parsed.error_code;
+                if (parsed.message) {
+                    message = parsed.message;
+                }
+            }
+            catch {
+                // ignore
+            }
+            throw new ApiError(`clusters/get failed ${res.status}: ${message}`, res.status, '2.0', text || message, code);
+        }
+        try {
+            return text ? JSON.parse(text) : {};
+        }
+        catch {
+            throw new Error('clusters/get returned invalid JSON.');
+        }
+    }
     async startCluster(clusterId, token) {
         const controller = new AbortController();
         token.onCancellationRequested(() => controller.abort());
@@ -134,6 +171,9 @@ class DatabricksClient {
         if (!res.ok) {
             throw new ApiError(`Start cluster failed ${res.status}: ${text || res.statusText}`, res.status, '2.0', text || res.statusText);
         }
+    }
+    async ensureClusterRunning(clusterId, options) {
+        return ensureClusterRunning(this.host, this.token, clusterId, options);
     }
     async exportWorkspaceSource(path) {
         return exportWorkspaceSource(this.host, this.token, path);
@@ -363,6 +403,23 @@ async function ensureDatabricksConfig(context, options) {
 async function configureConnection(context) {
     await ensureDatabricksConfig(context, { forcePrompt: true });
     void vscode.window.showInformationMessage('Databricks connection updated for future tool runs.');
+}
+async function getDefaultCluster(context) {
+    const config = vscode.workspace.getConfiguration('databricksTools');
+    const id = (config.get('defaultClusterId') || '').trim();
+    const name = (config.get('defaultClusterName') || '').trim();
+    return { id: id || undefined, name: name || undefined };
+}
+async function setDefaultCluster(context, id, name) {
+    const config = vscode.workspace.getConfiguration('databricksTools');
+    await config.update('defaultClusterId', id, vscode.ConfigurationTarget.Global);
+    await config.update('defaultClusterName', name, vscode.ConfigurationTarget.Global);
+}
+async function clearDefaultCluster(context) {
+    const config = vscode.workspace.getConfiguration('databricksTools');
+    await config.update('defaultClusterId', '', vscode.ConfigurationTarget.Global);
+    await config.update('defaultClusterName', '', vscode.ConfigurationTarget.Global);
+    void vscode.window.showInformationMessage('Default Databricks cluster cleared.');
 }
 async function clearStoredCredentials(context) {
     const choice = await vscode.window.showQuickPick([
@@ -656,6 +713,99 @@ async function runJobNow(host, token, jobId) {
         throw new Error('jobs/run-now did not return run_id.');
     }
     return { runId: parsed.run_id };
+}
+async function ensureClusterRunning(host, token, clusterId, options) {
+    const poll = options?.poll ?? true;
+    const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000;
+    const pollIntervalMs = options?.pollIntervalMs ?? 10 * 1000;
+    const start = Date.now();
+    const output = getOutputChannel();
+    const getState = async () => {
+        const searchParams = new URLSearchParams();
+        searchParams.set('cluster_id', clusterId);
+        const url = `${host}/api/2.0/clusters/get?${searchParams.toString()}`;
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+            },
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            let code;
+            let message = text || res.statusText;
+            try {
+                const parsed = text ? JSON.parse(text) : {};
+                code = parsed.error_code;
+                if (parsed.message) {
+                    message = parsed.message;
+                }
+            }
+            catch {
+                // ignore
+            }
+            throw new ApiError(`clusters/get failed ${res.status}: ${message}`, res.status, '2.0', text || message, code);
+        }
+        try {
+            const parsed = text ? JSON.parse(text) : {};
+            return (parsed.state || 'UNKNOWN').toUpperCase();
+        }
+        catch {
+            return 'UNKNOWN';
+        }
+    };
+    const triggerStart = async () => {
+        const url = `${host}/api/2.0/clusters/start`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ cluster_id: clusterId }),
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            let code;
+            let message = text || res.statusText;
+            try {
+                const parsed = text ? JSON.parse(text) : {};
+                code = parsed.error_code;
+                if (parsed.message) {
+                    message = parsed.message;
+                }
+            }
+            catch {
+                // ignore
+            }
+            throw new ApiError(`Start cluster failed ${res.status}: ${message}`, res.status, '2.0', text || message, code);
+        }
+    };
+    const initial = await getState();
+    if (initial === 'RUNNING') {
+        return 'RUNNING';
+    }
+    output.appendLine(`Cluster ${clusterId} is ${initial}, requesting start...`);
+    await triggerStart();
+    if (!poll) {
+        return 'RUNNING';
+    }
+    while (Date.now() - start < timeoutMs) {
+        await sleep(pollIntervalMs);
+        const state = await getState();
+        output.appendLine(`Cluster ${clusterId} state: ${state}`);
+        if (state === 'RUNNING') {
+            return 'RUNNING';
+        }
+        if (state === 'ERROR' || state === 'TERMINATED') {
+            return 'ERROR';
+        }
+    }
+    output.appendLine(`Cluster ${clusterId} did not reach RUNNING within ${Math.round(timeoutMs / 1000)}s.`);
+    return 'ERROR';
+}
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 async function getRunDetails(host, token, runId) {
     const output = getOutputChannel();

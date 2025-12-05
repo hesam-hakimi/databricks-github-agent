@@ -255,7 +255,13 @@ class DatabricksCreateAndRunJobFromCodeTool {
     }
     async prepareInvocation(options, _token) {
         const { jobName } = options.input;
-        const message = `Upload code, create a Databricks job, and start a run for ${jobName}.`;
+        const clusterMode = options.input.clusterMode ?? 'defaultCluster';
+        const clusterTarget = clusterMode === 'newJobCluster'
+            ? 'a new job cluster'
+            : clusterMode === 'existingCluster'
+                ? 'the specified existing cluster'
+                : 'the default cluster (auto-start if needed)';
+        const message = `Upload code, create a Databricks job, and start a run for ${jobName} on ${clusterTarget}.`;
         return {
             invocationMessage: message,
             confirmationMessages: {
@@ -267,7 +273,7 @@ class DatabricksCreateAndRunJobFromCodeTool {
     async invoke(options, _token) {
         const input = options.input;
         try {
-            const markdown = await createAndRunJobFromCode(this.context, input);
+            const markdown = await createAndRunJobFromCode(this.context, input, _token);
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
         }
         catch (err) {
@@ -312,20 +318,32 @@ class DatabricksStartClusterTool {
     }
     async prepareInvocation(options, _token) {
         const { clusterId } = options.input;
+        const message = clusterId
+            ? `Start Databricks cluster ${clusterId}.`
+            : 'Start the default Databricks cluster (or pick one if no default is set).';
         return {
-            invocationMessage: `Start Databricks cluster ${clusterId}.`,
+            invocationMessage: message,
             confirmationMessages: {
                 title: 'Databricks: Start Cluster',
-                message: new vscode.MarkdownString(`Start Databricks cluster **${clusterId}**? This may incur cost.`),
+                message: new vscode.MarkdownString(message),
             },
         };
     }
     async invoke(options, token) {
-        const { clusterId } = options.input;
+        const inputClusterId = options.input.clusterId?.trim();
         try {
             const client = await databricksClient_1.DatabricksClient.fromConfig(this.context);
-            await client.startCluster(clusterId, token);
-            const msg = `Cluster start requested for ${clusterId}. Databricks accepted the request. ` +
+            const resolved = await resolveClusterForStart(this.context, client, token, inputClusterId, {
+                promptToSetDefault: true,
+            });
+            if (!resolved?.id) {
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart('Cluster start cancelled; no cluster was selected.'),
+                ]);
+            }
+            await client.startCluster(resolved.id, token);
+            const clusterLabel = resolved.name ? `${resolved.name} (${resolved.id})` : resolved.id;
+            const msg = `Cluster start requested for ${clusterLabel}. Databricks accepted the request. ` +
                 'Use listDatabricksClusters to check status until RUNNING.';
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(msg)]);
         }
@@ -350,6 +368,23 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.configure', async () => {
         try {
             await (0, databricksClient_1.configureConnection)(context);
+            const pick = await vscode.window.showQuickPick([
+                { label: 'Select default cluster now', value: 'choose' },
+                { label: 'Skip', value: 'skip' },
+            ], { title: 'Select a default cluster?', ignoreFocusOut: true });
+            if (pick?.value === 'choose') {
+                const cts = new vscode.CancellationTokenSource();
+                try {
+                    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+                    await chooseDefaultCluster(context, client, cts.token, {
+                        allowClear: true,
+                        title: 'Select Default Cluster (optional)',
+                    });
+                }
+                finally {
+                    cts.dispose();
+                }
+            }
             viewProvider.refresh('Configured');
         }
         catch (err) {
@@ -365,6 +400,21 @@ function activate(context) {
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             void vscode.window.showErrorMessage(`Failed to clear Databricks credentials: ${message}`);
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.setDefaultCluster', async () => {
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            await chooseDefaultCluster(context, client, cts.token, { allowClear: true, title: 'Select Default Cluster' });
+            viewProvider.refresh('Default cluster updated');
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'set default cluster');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
         }
     }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.testConnection', async () => {
@@ -427,23 +477,44 @@ function activate(context) {
         }
     }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.startCluster', async () => {
-        const clusterId = await vscode.window.showInputBox({
-            title: 'Databricks Cluster ID',
-            prompt: 'Enter the cluster ID to start',
-            validateInput: value => (value.trim() ? null : 'Cluster ID is required'),
-        });
-        if (!clusterId) {
-            return;
-        }
-        const confirmed = await vscode.window.showWarningMessage(`Start Databricks cluster ${clusterId}? This may incur cost.`, { modal: true }, 'Start', 'Cancel');
-        if (confirmed !== 'Start') {
-            return;
-        }
         const cts = new vscode.CancellationTokenSource();
         try {
             const client = await databricksClient_1.DatabricksClient.fromConfig(context);
-            await client.startCluster(clusterId.trim(), cts.token);
-            void vscode.window.showInformationMessage(`Cluster start requested for ${clusterId}. Use "List Clusters" to monitor status.`);
+            const currentDefault = await (0, databricksClient_1.getDefaultCluster)(context);
+            let resolved;
+            if (currentDefault.id) {
+                const pick = await vscode.window.showQuickPick([
+                    {
+                        label: `Start default cluster ${currentDefault.name ?? currentDefault.id}`,
+                        description: currentDefault.id,
+                        value: 'default',
+                    },
+                    { label: 'Start a different cluster…', value: 'other' },
+                    { label: 'Cancel', value: 'cancel' },
+                ], { title: 'Start Cluster', ignoreFocusOut: true });
+                if (!pick || pick.value === 'cancel') {
+                    return;
+                }
+                if (pick.value === 'default') {
+                    resolved = { id: currentDefault.id, name: currentDefault.name };
+                }
+                else {
+                    resolved = await pickClusterFromList(client, cts.token, { title: 'Select a cluster to start' });
+                }
+            }
+            else {
+                resolved = await resolveClusterForStart(context, client, cts.token, undefined, { promptToSetDefault: true });
+            }
+            if (!resolved?.id) {
+                return;
+            }
+            const confirmLabel = resolved.name ? `${resolved.name} (${resolved.id})` : resolved.id;
+            const confirmed = await vscode.window.showWarningMessage(`Start Databricks cluster ${confirmLabel}? This may incur cost.`, { modal: true }, 'Start', 'Cancel');
+            if (confirmed !== 'Start') {
+                return;
+            }
+            await client.startCluster(resolved.id.trim(), cts.token);
+            void vscode.window.showInformationMessage(`Cluster start requested for ${confirmLabel}. Use "List Clusters" to monitor status.`);
             viewProvider.refresh('Cluster start requested');
         }
         catch (err) {
@@ -545,11 +616,11 @@ function activate(context) {
         const cts = new vscode.CancellationTokenSource();
         try {
             const client = await databricksClient_1.DatabricksClient.fromConfig(context);
-            const input = await promptCreateJobFromCodeInput(client, cts.token);
+            const input = await promptCreateJobFromCodeInput(context, client, cts.token);
             if (!input) {
                 return;
             }
-            const markdown = await createAndRunJobFromCode(context, input);
+            const markdown = await createAndRunJobFromCode(context, input, cts.token);
             const output = (0, databricksClient_1.getOutputChannel)();
             output.appendLine(markdown);
             output.show(true);
@@ -727,7 +798,213 @@ async function promptNotebookSourceInput() {
     }
     return { jobId: Number(jobId.trim()), taskKey: taskKey.trim(), maxSourceChars: parsedMax };
 }
-async function promptCreateJobFromCodeInput(client, token) {
+async function pickClusterFromList(client, token, options) {
+    let clusters = [];
+    try {
+        clusters = await client.listClusters(token);
+    }
+    catch (err) {
+        const message = formatDatabricksError(err, 'cluster list');
+        void vscode.window.showErrorMessage(message);
+        return undefined;
+    }
+    if (clusters.length === 0) {
+        void vscode.window.showInformationMessage('No clusters found in the workspace.');
+        return undefined;
+    }
+    const items = clusters.slice(0, 200).map(c => {
+        const label = c.cluster_name ?? c.cluster_id ?? 'Cluster';
+        const description = c.cluster_id ?? '';
+        const detail = `state=${c.state ?? 'n/a'}, source=${c.cluster_source ?? 'n/a'}, runtime=${c.spark_version ?? 'n/a'}`;
+        return {
+            label,
+            description,
+            detail,
+            cluster: {
+                id: c.cluster_id ?? '',
+                name: c.cluster_name,
+                state: c.state,
+                source: c.cluster_source,
+            },
+        };
+    });
+    const pick = await vscode.window.showQuickPick(items, {
+        title: options.title,
+        placeHolder: options.placeHolder ?? 'Select a cluster',
+        ignoreFocusOut: true,
+    });
+    return pick?.cluster?.id ? pick.cluster : undefined;
+}
+async function chooseDefaultCluster(context, client, token, options) {
+    const currentDefault = await (0, databricksClient_1.getDefaultCluster)(context);
+    let clusters = [];
+    try {
+        clusters = await client.listClusters(token);
+    }
+    catch (err) {
+        const message = formatDatabricksError(err, 'cluster list');
+        void vscode.window.showErrorMessage(message);
+        return undefined;
+    }
+    if (clusters.length === 0) {
+        void vscode.window.showInformationMessage('No clusters found to set as default.');
+        return undefined;
+    }
+    const items = clusters.map(c => {
+        const label = c.cluster_name ?? c.cluster_id ?? 'Cluster';
+        const description = c.cluster_id ?? '';
+        const detail = `state=${c.state ?? 'n/a'}, source=${c.cluster_source ?? 'n/a'}, runtime=${c.spark_version ?? 'n/a'}`;
+        return {
+            label,
+            description,
+            detail,
+            cluster: { id: c.cluster_id ?? '', name: c.cluster_name, state: c.state, source: c.cluster_source },
+        };
+    });
+    if (options?.allowClear && currentDefault.id) {
+        items.push({
+            label: 'Clear default cluster',
+            description: currentDefault.id,
+            detail: currentDefault.name ?? '',
+            clear: true,
+        });
+    }
+    const pick = await vscode.window.showQuickPick(items, {
+        title: options?.title ?? 'Select default cluster',
+        placeHolder: 'Pick a cluster to set as default',
+        ignoreFocusOut: true,
+    });
+    if (!pick) {
+        return undefined;
+    }
+    if (pick.clear) {
+        await (0, databricksClient_1.clearDefaultCluster)(context);
+        return undefined;
+    }
+    if (!pick.cluster || !pick.cluster.id) {
+        void vscode.window.showErrorMessage('Cluster selection is invalid.');
+        return undefined;
+    }
+    await (0, databricksClient_1.setDefaultCluster)(context, pick.cluster.id, pick.cluster.name ?? pick.cluster.id);
+    void vscode.window.showInformationMessage(`Default cluster set to ${pick.cluster.name ?? pick.cluster.id} (${pick.cluster.id}).`);
+    return pick.cluster;
+}
+async function ensureDefaultClusterSelected(context, client, token) {
+    const current = await (0, databricksClient_1.getDefaultCluster)(context);
+    if (current.id) {
+        return { id: current.id, name: current.name };
+    }
+    return chooseDefaultCluster(context, client, token, { allowClear: false, title: 'Select a default cluster' });
+}
+async function ensureClusterReady(client, clusterId, options) {
+    let initialState;
+    let clusterName;
+    let clusterSource;
+    try {
+        const details = await client.getCluster(clusterId);
+        initialState = details.state?.toUpperCase();
+        clusterName = details.cluster_name;
+        clusterSource = details.cluster_source;
+    }
+    catch {
+        // best-effort, ignore
+    }
+    const status = await client.ensureClusterRunning(clusterId, {
+        poll: true,
+        timeoutMs: options?.timeoutMs ?? 10 * 60 * 1000,
+        pollIntervalMs: options?.pollIntervalMs ?? 10 * 1000,
+    });
+    let finalState = status === 'RUNNING' ? 'RUNNING' : undefined;
+    try {
+        const details = await client.getCluster(clusterId);
+        finalState = details.state?.toUpperCase() ?? finalState;
+        clusterName = clusterName ?? details.cluster_name;
+        clusterSource = clusterSource ?? details.cluster_source;
+    }
+    catch {
+        // ignore
+    }
+    return { status, initialState, finalState, clusterName, clusterSource };
+}
+async function resolveClusterForExecution(context, client, mode, existingClusterId, token) {
+    let clusterId = existingClusterId;
+    let clusterName;
+    let clusterSource;
+    if (mode === 'defaultCluster') {
+        const def = await ensureDefaultClusterSelected(context, client, token);
+        if (!def || !def.id) {
+            throw new Error('No default cluster is configured. Please select a default cluster.');
+        }
+        clusterId = def.id;
+        clusterName = def.name;
+        clusterSource = def.source;
+    }
+    else {
+        if (!clusterId) {
+            throw new Error('existingClusterId is required when clusterMode is existingCluster.');
+        }
+        try {
+            const details = await client.getCluster(clusterId);
+            clusterName = details.cluster_name;
+            clusterSource = details.cluster_source;
+        }
+        catch {
+            // best-effort; continue
+        }
+    }
+    const readiness = await ensureClusterReady(client, clusterId, {
+        timeoutMs: 10 * 60 * 1000,
+        pollIntervalMs: 10 * 1000,
+    });
+    if (readiness.status === 'ERROR') {
+        if (mode === 'defaultCluster') {
+            throw new Error('Default cluster could not be started, please check in Databricks UI.');
+        }
+        throw new Error('Cluster could not be started. Please verify the cluster in Databricks.');
+    }
+    const autoStarted = readiness.initialState ? readiness.initialState !== 'RUNNING' : false;
+    return {
+        clusterId: clusterId,
+        clusterName: readiness.clusterName ?? clusterName,
+        clusterSource: readiness.clusterSource ?? clusterSource,
+        initialState: readiness.initialState,
+        finalState: readiness.finalState,
+        autoStarted,
+    };
+}
+async function resolveClusterForStart(context, client, token, inputClusterId, options) {
+    if (inputClusterId) {
+        let name;
+        try {
+            const details = await client.getCluster(inputClusterId);
+            name = details.cluster_name;
+        }
+        catch {
+            // ignore
+        }
+        return { id: inputClusterId, name };
+    }
+    const currentDefault = await (0, databricksClient_1.getDefaultCluster)(context);
+    if (currentDefault.id) {
+        return { id: currentDefault.id, name: currentDefault.name };
+    }
+    const picked = await pickClusterFromList(client, token, { title: 'Select a cluster to start' });
+    if (!picked) {
+        return undefined;
+    }
+    if (options?.promptToSetDefault) {
+        const setDefaultPick = await vscode.window.showQuickPick([
+            { label: 'Yes', description: 'Set this as the default cluster', value: true },
+            { label: 'No', description: 'Use just for now', value: false },
+        ], { title: 'Set this cluster as default?', ignoreFocusOut: true });
+        if (setDefaultPick?.value) {
+            await (0, databricksClient_1.setDefaultCluster)(context, picked.id, picked.name ?? picked.id);
+            void vscode.window.showInformationMessage(`Default cluster set to ${picked.name ?? picked.id}.`);
+        }
+    }
+    return picked;
+}
+async function promptCreateJobFromCodeInput(context, client, token) {
     const jobName = await vscode.window.showInputBox({
         title: 'Job name',
         prompt: 'Enter a name for the new Databricks job/run',
@@ -760,11 +1037,29 @@ async function promptCreateJobFromCodeInput(client, token) {
         return undefined;
     }
     const clusterModePick = await vscode.window.showQuickPick([
+        {
+            label: 'Use default cluster (recommended)',
+            description: 'Auto-use saved default cluster; will prompt if none is set',
+            value: 'defaultCluster',
+        },
         { label: 'Use existing cluster', value: 'existingCluster' },
         { label: 'Create new job cluster', value: 'newJobCluster' },
     ], { title: 'Cluster selection', placeHolder: 'Choose how to run the job', ignoreFocusOut: true });
     if (!clusterModePick) {
         return undefined;
+    }
+    if (clusterModePick.value === 'defaultCluster') {
+        const selectedDefault = await ensureDefaultClusterSelected(context, client, token);
+        if (!selectedDefault) {
+            return undefined;
+        }
+        return {
+            jobName: jobName.trim(),
+            sourceCode,
+            language,
+            workspacePath: workspacePath?.trim() || undefined,
+            clusterMode: 'defaultCluster',
+        };
     }
     if (clusterModePick.value === 'existingCluster') {
         let clusters = [];
@@ -879,19 +1174,21 @@ function parseOptionalPositiveInt(value) {
     }
     return Math.floor(parsed);
 }
-async function createAndRunJobFromCode(context, input) {
+async function createAndRunJobFromCode(context, input, token) {
     const jobName = input.jobName?.trim();
     const sourceCode = input.sourceCode;
     if (!jobName || !sourceCode) {
         throw new Error('jobName and sourceCode are required to create and run a job.');
     }
     const language = (input.language ?? 'PYTHON').toUpperCase();
-    const clusterMode = input.clusterMode === 'newJobCluster' ? 'newJobCluster' : 'existingCluster';
-    if (clusterMode === 'existingCluster' && !input.existingClusterId) {
-        throw new Error('existingClusterId is required when clusterMode is existingCluster.');
-    }
+    const requestedClusterMode = input.clusterMode ?? 'defaultCluster';
+    const effectiveToken = token ?? new vscode.CancellationTokenSource().token;
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
     let newClusterConfig;
-    if (clusterMode === 'newJobCluster') {
+    let clusterInfo = { mode: requestedClusterMode };
+    let clusterModeForJob;
+    let existingClusterId = input.existingClusterId;
+    if (requestedClusterMode === 'newJobCluster') {
         const cfg = input.newClusterConfig;
         if (!cfg || !cfg.sparkVersion || !cfg.nodeTypeId) {
             throw new Error('newClusterConfig.sparkVersion and nodeTypeId are required when clusterMode is newJobCluster.');
@@ -902,17 +1199,31 @@ async function createAndRunJobFromCode(context, input) {
             numWorkers: normalizeOptionalInt(cfg.numWorkers, 1),
             autoTerminationMinutes: normalizeOptionalInt(cfg.autoTerminationMinutes, 60),
         };
+        clusterModeForJob = 'newJobCluster';
     }
-    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    else {
+        const resolved = await resolveClusterForExecution(context, client, requestedClusterMode, existingClusterId, effectiveToken);
+        clusterModeForJob = 'existingCluster';
+        existingClusterId = resolved.clusterId;
+        clusterInfo = {
+            mode: requestedClusterMode,
+            clusterId: resolved.clusterId,
+            clusterName: resolved.clusterName,
+            clusterSource: resolved.clusterSource,
+            initialState: resolved.initialState,
+            finalState: resolved.finalState,
+            autoStarted: resolved.autoStarted,
+        };
+    }
     const defaultFolder = getDefaultUploadFolder();
     const targetPath = buildWorkspaceUploadPath(jobName, language, input.workspacePath, defaultFolder);
     await client.importWorkspaceSource(targetPath, language, sourceCode);
-    const { jobId } = await client.createJobFromNotebook(jobName, targetPath, clusterMode, {
-        existingClusterId: input.existingClusterId,
+    const { jobId } = await client.createJobFromNotebook(jobName, targetPath, clusterModeForJob, {
+        existingClusterId,
         newClusterConfig,
     });
     const { runId } = await client.runJobNow(jobId);
-    return formatCreateAndRunJobResult(jobId, runId, jobName, targetPath, clusterMode, input.existingClusterId, newClusterConfig);
+    return formatCreateAndRunJobResult(jobId, runId, jobName, targetPath, clusterInfo, newClusterConfig);
 }
 async function fetchTaskSources(client, tasks, maxSourceCharsPerTask, token) {
     const results = [];
@@ -1027,7 +1338,7 @@ function formatNotebookSource(path, language, source, truncated, maxSourceChars)
     }
     return lines.join('\n');
 }
-function formatCreateAndRunJobResult(jobId, runId, jobName, path, clusterMode, existingClusterId, newClusterConfig) {
+function formatCreateAndRunJobResult(jobId, runId, jobName, path, clusterInfo, newClusterConfig) {
     const lines = [];
     lines.push('## Job created and run started on Databricks');
     lines.push('');
@@ -1035,11 +1346,28 @@ function formatCreateAndRunJobResult(jobId, runId, jobName, path, clusterMode, e
     lines.push(`Run ID: \`${runId}\``);
     lines.push(`Run name: \`${jobName}\``);
     lines.push(`Notebook path: \`${path}\``);
-    if (clusterMode === 'existingCluster') {
-        lines.push(`Cluster mode: existingCluster (id: ${existingClusterId ?? 'n/a'})`);
-    }
-    else if (newClusterConfig) {
+    if (clusterInfo.mode === 'newJobCluster' && newClusterConfig) {
         lines.push(`Cluster mode: newJobCluster (runtime ${newClusterConfig.sparkVersion}, node ${newClusterConfig.nodeTypeId}, workers ${newClusterConfig.numWorkers ?? 1}, auto-term ${newClusterConfig.autoTerminationMinutes ?? 60}m)`);
+    }
+    else {
+        const label = clusterInfo.mode === 'defaultCluster' ? 'default cluster' : 'existing cluster';
+        const clusterLabel = clusterInfo.clusterName ?? clusterInfo.clusterId ?? 'n/a';
+        const autoStartNote = clusterInfo.autoStarted ? ` — was ${clusterInfo.initialState ?? 'not running'}, started automatically.` : '';
+        const clusterLine = 'Cluster: ' +
+            label +
+            ' `' +
+            clusterLabel +
+            '` (`' +
+            (clusterInfo.clusterId ?? 'n/a') +
+            '`)' +
+            autoStartNote;
+        lines.push(clusterLine);
+        if (clusterInfo.clusterSource) {
+            lines.push(`- source: ${clusterInfo.clusterSource}`);
+        }
+        if (clusterInfo.finalState) {
+            lines.push(`- final state: ${clusterInfo.finalState}`);
+        }
     }
     lines.push('');
     lines.push('You can now:');
