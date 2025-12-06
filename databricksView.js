@@ -172,6 +172,16 @@ class DatabricksViewProvider {
                 icon: 'beaker',
             }),
             new SimpleTreeItem({
+                label: 'Execute SQL on All-purpose Cluster…',
+                command: { command: 'databricksTools.executeSqlOnCluster', title: 'Execute SQL on All-purpose Cluster' },
+                icon: 'database',
+            }),
+            new SimpleTreeItem({
+                label: 'Execute Python on All-purpose Cluster…',
+                command: { command: 'databricksTools.executePythonOnCluster', title: 'Execute Python on All-purpose Cluster' },
+                icon: 'run',
+            }),
+            new SimpleTreeItem({
                 label: 'Get Job Runs…',
                 command: { command: 'databricksTools.getRuns', title: 'Get Job Runs' },
                 icon: 'list-ordered',

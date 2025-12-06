@@ -183,6 +183,64 @@ class DatabricksProfileTableLayoutTool {
         }
     }
 }
+class DatabricksExecuteSqlOnClusterTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const sql = options.input.sql?.trim() ?? '';
+        const preview = sql.length > 120 ? `${sql.slice(0, 120)}…` : sql || 'SQL statement';
+        const target = options.input.clusterId ? `cluster ${options.input.clusterId}` : 'default all-purpose cluster';
+        const message = `Execute SQL on ${target}: ${preview}`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Execute SQL on All-purpose Cluster',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await executeSqlOnCluster(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'execute SQL on cluster');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksExecutePythonOnClusterTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const code = options.input.code?.trim() ?? '';
+        const preview = code.length > 120 ? `${code.slice(0, 120)}…` : code || 'Python code';
+        const target = options.input.clusterId ? `cluster ${options.input.clusterId}` : 'default all-purpose cluster';
+        const message = `Execute Python on ${target}: ${preview}`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Execute Python on All-purpose Cluster',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await executePythonOnCluster(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'execute Python on cluster');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
 class DatabricksRunCodeAndGetResultTool {
     context;
     constructor(context) {
@@ -458,6 +516,8 @@ function activate(context) {
     context.subscriptions.push(vscode.lm.registerTool('databricks_profile_table_layout', new DatabricksProfileTableLayoutTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_list_clusters', new DatabricksListClustersTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_start_cluster', new DatabricksStartClusterTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_execute_sql_on_cluster', new DatabricksExecuteSqlOnClusterTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_execute_python_on_cluster', new DatabricksExecutePythonOnClusterTool(context)));
     const viewProvider = new databricksView_1.DatabricksViewProvider(context);
     const view = vscode.window.createTreeView('databricksTools.view', { treeDataProvider: viewProvider, showCollapseAll: false });
     context.subscriptions.push(view);
@@ -967,6 +1027,56 @@ function activate(context) {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'run code and get result');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.executeSqlOnCluster', async () => {
+        const sql = await vscode.window.showInputBox({
+            title: 'Databricks SQL (all-purpose cluster)',
+            prompt: 'Enter a SQL statement to run on the default all-purpose cluster',
+            ignoreFocusOut: true,
+        });
+        if (!sql?.trim()) {
+            return;
+        }
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await executeSqlOnCluster(context, { sql: sql.trim(), maxRows: 1000, timeoutSeconds: 60 }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'execute SQL on cluster');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.executePythonOnCluster', async () => {
+        const editor = vscode.window.activeTextEditor;
+        const selection = editor?.selection && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : undefined;
+        const code = selection || editor?.document.getText() || (await vscode.window.showInputBox({
+            title: 'Databricks Python (all-purpose cluster)',
+            prompt: 'Enter Python code to run on the default all-purpose cluster',
+            ignoreFocusOut: true,
+        }));
+        if (!code?.trim()) {
+            return;
+        }
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await executePythonOnCluster(context, { code: code.trim(), timeoutSeconds: 60 }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'execute Python on cluster');
             void vscode.window.showErrorMessage(message);
         }
         finally {
@@ -1643,6 +1753,70 @@ async function runCodeAndGetResult(context, input, token) {
         rowLimit: maxRows,
     });
 }
+async function executeSqlOnCluster(context, input, token) {
+    const sql = input.sql?.trim();
+    if (!sql) {
+        throw new Error('SQL statement is required.');
+    }
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const clusterId = input.clusterId?.trim() || (await (0, databricksClient_1.getDefaultCluster)(context)).id;
+    if (!clusterId) {
+        return 'No default all-purpose cluster configured. Please select one in the Databricks Tools view.';
+    }
+    let clusterName;
+    try {
+        const details = await client.getCluster(clusterId);
+        clusterName = details.cluster_name;
+    }
+    catch {
+        // best effort
+    }
+    const ready = await client.ensureClusterRunning(clusterId, { poll: true, timeoutMs: 8 * 60 * 1000, pollIntervalMs: 10 * 1000 });
+    if (ready === 'ERROR') {
+        throw new Error('Cluster could not be started. Please verify the default cluster in Databricks.');
+    }
+    const result = await client.executeClusterSql({
+        sql,
+        clusterId,
+        maxRows: normalizeRowLimit(input.maxRows ?? 1000),
+        timeoutSeconds: input.timeoutSeconds ?? 60,
+    }, token);
+    return formatSqlCommandResult({
+        clusterId,
+        clusterName,
+        sql,
+        result,
+    });
+}
+async function executePythonOnCluster(context, input, token) {
+    const code = input.code?.trim();
+    if (!code) {
+        throw new Error('Python code is required.');
+    }
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const clusterId = input.clusterId?.trim() || (await (0, databricksClient_1.getDefaultCluster)(context)).id;
+    if (!clusterId) {
+        return 'No default all-purpose cluster configured. Please select one in the Databricks Tools view.';
+    }
+    let clusterName;
+    try {
+        const details = await client.getCluster(clusterId);
+        clusterName = details.cluster_name;
+    }
+    catch {
+        // best effort
+    }
+    const ready = await client.ensureClusterRunning(clusterId, { poll: true, timeoutMs: 8 * 60 * 1000, pollIntervalMs: 10 * 1000 });
+    if (ready === 'ERROR') {
+        throw new Error('Cluster could not be started. Please verify the default cluster in Databricks.');
+    }
+    const result = await client.executeClusterPython({
+        code,
+        clusterId,
+        timeoutSeconds: input.timeoutSeconds ?? 60,
+    }, token);
+    return formatPythonCommandResult({ clusterId, clusterName, code, result });
+}
 const TABLE_PROFILE_NOTEBOOK_SOURCE = [
     '# Databricks table layout profiler',
     'import json',
@@ -2136,6 +2310,105 @@ function formatRunResultMarkdown(args) {
     lines.push('- Ask for run details or logs with the run ID above.');
     lines.push('- Re-run or extend this code by modifying the source and running again.');
     return lines.join('\n');
+}
+function formatSqlCommandResult(args) {
+    const lines = [];
+    lines.push('## SQL Result (All-purpose Cluster)');
+    lines.push('');
+    lines.push(`Cluster: \`${args.clusterName ?? args.clusterId}\``);
+    if (args.result.contextId) {
+        lines.push(`Context: \`${args.result.contextId}\``);
+    }
+    if (args.result.commandId) {
+        lines.push(`Command: \`${args.result.commandId}\``);
+    }
+    lines.push('');
+    lines.push('**SQL**');
+    lines.push('```sql');
+    lines.push(args.sql);
+    lines.push('```');
+    lines.push('');
+    if (args.result.type === 'table') {
+        const table = renderMarkdownTable(args.result.columns ?? [], args.result.rows ?? []);
+        lines.push(table);
+        if (args.result.truncated) {
+            lines.push('');
+            lines.push('_Rows truncated to maxRows limit._');
+        }
+    }
+    else if (args.result.type === 'text') {
+        lines.push('```');
+        lines.push(args.result.text ?? '');
+        lines.push('```');
+    }
+    else if (args.result.type === 'error') {
+        lines.push('**Error**');
+        lines.push('');
+        lines.push(args.result.error ?? 'Command failed.');
+    }
+    else {
+        lines.push('_No result returned._');
+    }
+    return lines.join('\n');
+}
+function formatPythonCommandResult(args) {
+    const lines = [];
+    lines.push('## Python Result (All-purpose Cluster)');
+    lines.push('');
+    lines.push(`Cluster: \`${args.clusterName ?? args.clusterId}\``);
+    if (args.result.contextId) {
+        lines.push(`Context: \`${args.result.contextId}\``);
+    }
+    if (args.result.commandId) {
+        lines.push(`Command: \`${args.result.commandId}\``);
+    }
+    lines.push('');
+    lines.push('**Code**');
+    lines.push('```python');
+    lines.push(args.code);
+    lines.push('```');
+    lines.push('');
+    if (args.result.type === 'text') {
+        lines.push('```');
+        lines.push(args.result.text ?? '');
+        lines.push('```');
+    }
+    else if (args.result.type === 'error') {
+        lines.push('**Error**');
+        lines.push('');
+        lines.push(args.result.error ?? 'Command failed.');
+    }
+    else if (args.result.type === 'table') {
+        const table = renderMarkdownTable(args.result.columns ?? [], args.result.rows ?? []);
+        lines.push(table);
+    }
+    else {
+        lines.push('_No result returned._');
+    }
+    return lines.join('\n');
+}
+function renderMarkdownTable(columns, rows) {
+    if (!columns.length) {
+        return '_No columns returned._';
+    }
+    const header = `| ${columns.join(' | ')} |`;
+    const sep = `| ${columns.map(() => '---').join(' | ')} |`;
+    const body = rows.map(r => `| ${r.map(v => formatTableValue(v)).join(' | ')} |`).join('\n');
+    return [header, sep, body].filter(Boolean).join('\n');
+}
+function formatTableValue(value) {
+    if (value === null || value === undefined) {
+        return '';
+    }
+    if (typeof value === 'object') {
+        try {
+            return JSON.stringify(value);
+        }
+        catch {
+            return String(value);
+        }
+    }
+    return String(value);
 }
 function formatWorkspaceExportError(path, err) {
     if (err instanceof databricksClient_1.ApiError) {

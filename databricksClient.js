@@ -53,6 +53,7 @@ exports.createJobFromNotebook = createJobFromNotebook;
 exports.runJobNow = runJobNow;
 exports.submitNotebookRun = submitNotebookRun;
 exports.submitSingleTaskRun = submitSingleTaskRun;
+exports.__clearCommandContextCacheForTest = __clearCommandContextCacheForTest;
 exports.ensureClusterRunning = ensureClusterRunning;
 exports.getRunDetails = getRunDetails;
 exports.getRunOutput = getRunOutput;
@@ -62,6 +63,7 @@ const util_1 = require("util");
 const child_process_1 = require("child_process");
 const workspacePath_1 = require("./workspacePath");
 const exec = (0, util_1.promisify)(child_process_1.exec);
+const commandContextCache = new Map(); // key = `${clusterId}:${language}`
 class ConfigCancelled extends Error {
     constructor(message) {
         super(message);
@@ -198,6 +200,12 @@ class DatabricksClient {
     }
     async submitSingleTaskRun(args, cancelToken) {
         return submitSingleTaskRun(this.host, this.token, args, cancelToken);
+    }
+    async executeClusterSql(params, cancelToken) {
+        return executeClusterCommand(this.host, this.token, { ...params, language: 'sql' }, cancelToken);
+    }
+    async executeClusterPython(params, cancelToken) {
+        return executeClusterCommand(this.host, this.token, { ...params, language: 'python', maxRows: 0 }, cancelToken);
     }
     async getRunDetails(runId, cancelToken) {
         return getRunDetails(this.host, this.token, runId, cancelToken);
@@ -879,6 +887,196 @@ async function submitSingleTaskRun(host, token, args, cancelToken) {
         throw new Error('jobs/runs/submit did not return run_id.');
     }
     return { runId: parsed.run_id };
+}
+async function createCommandContext(host, token, clusterId, language, cancelToken) {
+    const output = getOutputChannel();
+    const url = `${host}/api/1.2/contexts/create`;
+    const payload = { clusterId, language };
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        output.appendLine(`contexts/create failed: HTTP ${res.status} ${text || res.statusText}`);
+        throw new ApiError(`contexts/create failed ${res.status}: ${text || res.statusText}`, res.status, '1.2', text || res.statusText);
+    }
+    try {
+        const parsed = text ? JSON.parse(text) : {};
+        if (!parsed.id) {
+            throw new Error('contexts/create did not return id');
+        }
+        return parsed.id;
+    }
+    catch (err) {
+        throw new Error('contexts/create returned invalid JSON.');
+    }
+}
+async function getOrCreateContext(host, token, clusterId, language, cancelToken) {
+    const key = `${clusterId}:${language}`;
+    const cached = commandContextCache.get(key);
+    if (cached) {
+        return cached;
+    }
+    const id = await createCommandContext(host, token, clusterId, language, cancelToken);
+    commandContextCache.set(key, id);
+    return id;
+}
+async function executeCommand(host, token, args, cancelToken) {
+    const output = getOutputChannel();
+    const url = `${host}/api/1.2/commands/execute`;
+    const payload = {
+        clusterId: args.clusterId,
+        contextId: args.contextId,
+        language: args.language,
+        command: args.command,
+    };
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        output.appendLine(`commands/execute failed: HTTP ${res.status} ${text || res.statusText}`);
+        throw new ApiError(`commands/execute failed ${res.status}: ${text || res.statusText}`, res.status, '1.2', text || res.statusText);
+    }
+    try {
+        const parsed = text ? JSON.parse(text) : {};
+        if (!parsed.id) {
+            throw new Error('commands/execute did not return id');
+        }
+        return parsed.id;
+    }
+    catch {
+        throw new Error('commands/execute returned invalid JSON.');
+    }
+}
+async function fetchCommandStatus(host, token, args, cancelToken) {
+    const output = getOutputChannel();
+    const searchParams = new URLSearchParams();
+    searchParams.set('clusterId', args.clusterId);
+    searchParams.set('contextId', args.contextId);
+    searchParams.set('commandId', args.commandId);
+    const url = `${host}/api/1.2/commands/status?${searchParams.toString()}`;
+    const controller = new AbortController();
+    cancelToken?.onCancellationRequested(() => controller.abort());
+    const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+        signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+        output.appendLine(`commands/status failed: HTTP ${res.status} ${text || res.statusText}`);
+        throw new ApiError(`commands/status failed ${res.status}: ${text || res.statusText}`, res.status, '1.2', text || res.statusText);
+    }
+    try {
+        const parsed = text ? JSON.parse(text) : {};
+        const status = parsed.status ?? 'UNKNOWN';
+        const results = parsed.results;
+        const error = parsed.error;
+        const contextInvalid = error ? /context.*not.*found|context.*does.*not.*exist/i.test(error) : false;
+        return { status, results, error, contextInvalid };
+    }
+    catch {
+        throw new Error('commands/status returned invalid JSON.');
+    }
+}
+async function executeClusterCommand(host, token, args, cancelToken) {
+    const language = args.language;
+    const commandText = language === 'sql' ? args.sql ?? '' : args.code ?? '';
+    if (!commandText.trim()) {
+        throw new Error('Command text is required.');
+    }
+    const timeoutMs = Math.max(1, Math.floor(args.timeoutSeconds * 1000));
+    const pollIntervalMs = 800;
+    const key = `${args.clusterId}:${language}`;
+    let contextId = await getOrCreateContext(host, token, args.clusterId, language, cancelToken);
+    let triedRefresh = false;
+    const runOnce = async () => {
+        const commandId = await executeCommand(host, token, { clusterId: args.clusterId, contextId, language, command: commandText }, cancelToken);
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const status = await fetchCommandStatus(host, token, { clusterId: args.clusterId, contextId, commandId }, cancelToken);
+            const normalized = (status.status || '').toLowerCase();
+            if (normalized === 'finished') {
+                return parseCommandResults(status.results, args.maxRows, { contextId, commandId });
+            }
+            if (normalized === 'error' || normalized === 'cancelled' || normalized === 'cancelling') {
+                if (status.contextInvalid && !triedRefresh) {
+                    commandContextCache.delete(key);
+                    triedRefresh = true;
+                    contextId = await getOrCreateContext(host, token, args.clusterId, language, cancelToken);
+                    return runOnce();
+                }
+                const errorText = status.error || status.results?.error || 'Command execution failed.';
+                return { type: 'error', error: errorText, contextId, commandId };
+            }
+            await delay(pollIntervalMs);
+        }
+        return {
+            type: 'error',
+            error: `Command timed out after ${args.timeoutSeconds} seconds.`,
+            contextId,
+            commandId,
+        };
+    };
+    const result = await runOnce();
+    if (result.type === 'error' && result.error && /context.*not.*found|context.*does.*not.*exist/i.test(result.error) && !triedRefresh) {
+        commandContextCache.delete(key);
+        triedRefresh = true;
+        contextId = await getOrCreateContext(host, token, args.clusterId, language, cancelToken);
+        return runOnce();
+    }
+    return result;
+}
+function parseCommandResults(results, maxRows, meta) {
+    if (!results) {
+        return { type: 'unknown', contextId: meta.contextId, commandId: meta.commandId };
+    }
+    const resultType = (results.resultType || '').toLowerCase();
+    if (resultType === 'table' && results.data && Array.isArray(results.data?.rows)) {
+        const columns = Array.isArray(results.data.schema?.columns)
+            ? results.data.schema.columns.map((c) => c.name ?? 'col')
+            : [];
+        const rows = results.data.rows ?? [];
+        const limited = rows.slice(0, maxRows > 0 ? maxRows : rows.length);
+        const truncated = maxRows > 0 && rows.length > limited.length;
+        return { type: 'table', columns, rows: limited, truncated, contextId: meta.contextId, commandId: meta.commandId };
+    }
+    if (typeof results.data === 'string') {
+        return { type: 'text', text: results.data, contextId: meta.contextId, commandId: meta.commandId };
+    }
+    if (typeof results.cause === 'string') {
+        return { type: 'error', error: results.cause, contextId: meta.contextId, commandId: meta.commandId };
+    }
+    if (typeof results.summary === 'string') {
+        return { type: 'text', text: results.summary, contextId: meta.contextId, commandId: meta.commandId };
+    }
+    return { type: 'unknown', contextId: meta.contextId, commandId: meta.commandId };
+}
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+// Exported for tests
+function __clearCommandContextCacheForTest() {
+    commandContextCache.clear();
 }
 async function ensureClusterRunning(host, token, clusterId, options) {
     const poll = options?.poll ?? true;
