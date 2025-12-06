@@ -37,7 +37,11 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 exports.createAndRunJobFromCode = createAndRunJobFromCode;
 exports.runCodeAndGetResult = runCodeAndGetResult;
+exports.showClusterDefinition = showClusterDefinition;
+exports.getClusterDefinitionMarkdown = getClusterDefinitionMarkdown;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
+const fs_1 = require("fs");
 const databricksClient_1 = require("./databricksClient");
 const databricksView_1 = require("./databricksView");
 const workspacePath_1 = require("./workspacePath");
@@ -183,6 +187,143 @@ class DatabricksProfileTableLayoutTool {
         }
     }
 }
+class DatabricksProfileTableStatsTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const target = options.input.tableName || options.input.path || 'table/path';
+        const message = `Profile table stats for ${target}`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Profile Table Stats',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await profileTableStats(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'profile table stats');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksAnalyzeRunStagesTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const { runId } = options.input;
+        const message = `Analyze Spark stages for Databricks run ${runId}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Analyze Run Stages',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await analyzeRunStages(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run stages analysis');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksExplainSqlTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const sql = options.input.sql?.trim() ?? '';
+        const preview = sql.length > 120 ? `${sql.slice(0, 120)}…` : sql || 'SQL statement';
+        const message = `Explain SQL (EXPLAIN FORMATTED): ${preview}`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Explain SQL',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await explainSql(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'explain SQL');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksSummarizeJobHistoryTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const { jobId } = options.input;
+        const limit = options.input.limit ?? 20;
+        const message = `Summarize recent ${limit} runs for Databricks job ${jobId}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Summarize Job History',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await summarizeJobHistory(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'job history summary');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksResolveArtifactMappingTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const target = options.input.jobId ? `job ${options.input.jobId}` : options.input.workspacePath || 'artifact';
+        const message = `Resolve Databricks artifact mapping for ${target}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Resolve Artifact Mapping',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, _token) {
+        try {
+            const markdown = await resolveArtifactMapping(this.context, options.input);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'resolve artifact mapping');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
 class DatabricksExecuteSqlOnClusterTool {
     context;
     constructor(context) {
@@ -237,6 +378,33 @@ class DatabricksExecutePythonOnClusterTool {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'execute Python on cluster');
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
+        }
+    }
+}
+class DatabricksGetClusterDefinitionTool {
+    context;
+    constructor(context) {
+        this.context = context;
+    }
+    async prepareInvocation(options, _token) {
+        const target = options.input.clusterId ? `cluster ${options.input.clusterId}` : 'default cluster';
+        const message = `Fetch Databricks cluster definition for ${target}.`;
+        return {
+            invocationMessage: message,
+            confirmationMessages: {
+                title: 'Databricks: Get Cluster Definition',
+                message: new vscode.MarkdownString(message),
+            },
+        };
+    }
+    async invoke(options, token) {
+        try {
+            const markdown = await getClusterDefinitionMarkdown(this.context, options.input, token);
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(markdown)]);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'get cluster definition');
             return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(message)]);
         }
     }
@@ -514,10 +682,16 @@ function activate(context) {
     context.subscriptions.push(vscode.lm.registerTool('databricks_get_run_details', new DatabricksGetRunDetailsTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_analyze_run_performance', new DatabricksAnalyzeRunPerformanceTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_profile_table_layout', new DatabricksProfileTableLayoutTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_profile_table_stats', new DatabricksProfileTableStatsTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_analyze_run_stages', new DatabricksAnalyzeRunStagesTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_explain_sql', new DatabricksExplainSqlTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_summarize_job_history', new DatabricksSummarizeJobHistoryTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_resolve_artifact_mapping', new DatabricksResolveArtifactMappingTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_list_clusters', new DatabricksListClustersTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_start_cluster', new DatabricksStartClusterTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_execute_sql_on_cluster', new DatabricksExecuteSqlOnClusterTool(context)));
     context.subscriptions.push(vscode.lm.registerTool('databricks_execute_python_on_cluster', new DatabricksExecutePythonOnClusterTool(context)));
+    context.subscriptions.push(vscode.lm.registerTool('databricks_get_cluster_definition', new DatabricksGetClusterDefinitionTool(context)));
     const viewProvider = new databricksView_1.DatabricksViewProvider(context);
     const view = vscode.window.createTreeView('databricksTools.view', { treeDataProvider: viewProvider, showCollapseAll: false });
     context.subscriptions.push(view);
@@ -903,6 +1077,79 @@ function activate(context) {
             cts.dispose();
         }
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.analyzeRunStages', async () => {
+        const runIdInput = await vscode.window.showInputBox({
+            title: 'Databricks Run ID',
+            prompt: 'Enter the run ID to analyze Spark stages',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim()) {
+                    return 'Run ID is required';
+                }
+                return /^\d+$/.test(value.trim()) ? null : 'Run ID must be a number';
+            },
+        });
+        if (!runIdInput) {
+            return;
+        }
+        const runId = Number(runIdInput.trim());
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await analyzeRunStages(context, { runId }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage(`Stage analysis ready for run ${runId}.`);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'run stages analysis');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.summarizeJobHistory', async () => {
+        const jobIdInput = await vscode.window.showInputBox({
+            title: 'Databricks Job ID',
+            prompt: 'Enter the job ID to summarize history',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim())
+                    return 'Job ID is required';
+                return /^\d+$/.test(value.trim()) ? null : 'Job ID must be numeric';
+            },
+        });
+        if (!jobIdInput) {
+            return;
+        }
+        const limitInput = await vscode.window.showInputBox({
+            title: 'History limit (optional)',
+            prompt: 'Number of recent runs to include (default 20)',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim())
+                    return null;
+                return /^\d+$/.test(value.trim()) ? null : 'Enter a positive integer or leave blank';
+            },
+        });
+        const limit = limitInput && limitInput.trim() ? Number(limitInput.trim()) : undefined;
+        const jobId = Number(jobIdInput.trim());
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await summarizeJobHistory(context, { jobId, limit }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'summarize job history');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.profileTableLayout', async () => {
         const targetMode = await vscode.window.showQuickPick([
             { label: 'Unity Catalog table', description: 'catalog.schema.table', value: 'table' },
@@ -990,6 +1237,36 @@ function activate(context) {
             cts.dispose();
         }
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.profileTableStats', async () => {
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const input = await promptTableStatsInput(context, cts.token);
+            if (!input) {
+                return;
+            }
+            const markdown = await profileTableStats(context, input, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+            void vscode.window.showInformationMessage('Table stats profiling completed.');
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'table stats profiling');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.addArtifactMapping', async () => {
+        try {
+            await addArtifactMapping();
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'add artifact mapping');
+            void vscode.window.showErrorMessage(message);
+        }
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.runCodeAndGetResult', async () => {
         const editor = vscode.window.activeTextEditor;
         const selection = editor?.selection && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : undefined;
@@ -1051,6 +1328,30 @@ function activate(context) {
         }
         catch (err) {
             const message = formatDatabricksError(err, 'execute SQL on cluster');
+            void vscode.window.showErrorMessage(message);
+        }
+        finally {
+            cts.dispose();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.explainSql', async () => {
+        const sql = await vscode.window.showInputBox({
+            title: 'EXPLAIN SQL',
+            prompt: 'Enter a SQL statement to explain (EXPLAIN FORMATTED)',
+            ignoreFocusOut: true,
+        });
+        if (!sql?.trim()) {
+            return;
+        }
+        const cts = new vscode.CancellationTokenSource();
+        try {
+            const markdown = await explainSql(context, { sql: sql.trim() }, cts.token);
+            const output = (0, databricksClient_1.getOutputChannel)();
+            output.appendLine(markdown);
+            output.show(true);
+        }
+        catch (err) {
+            const message = formatDatabricksError(err, 'explain SQL');
             void vscode.window.showErrorMessage(message);
         }
         finally {
@@ -1148,6 +1449,9 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('databricksTools.showLogs', async () => {
         const output = (0, databricksClient_1.getOutputChannel)();
         output.show(true);
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('databricksTools.showClusterDefinition', async () => {
+        await showClusterDefinition(context);
     }));
 }
 function deactivate() { }
@@ -1305,6 +1609,79 @@ async function ensureDefaultClusterSelected(context, client, token) {
         return { id: current.id, name: current.name };
     }
     return chooseDefaultCluster(context, client, token, { allowClear: false, title: 'Select a default cluster' });
+}
+async function showClusterDefinition(context) {
+    const cts = new vscode.CancellationTokenSource();
+    try {
+        const includeRawPick = await vscode.window.showQuickPick([
+            { label: 'Summary only', value: false },
+            { label: 'Summary + raw JSON (redacted)', value: true },
+        ], { title: 'Cluster definition output', ignoreFocusOut: true });
+        if (!includeRawPick) {
+            return;
+        }
+        const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+        const defaultCluster = await (0, databricksClient_1.getDefaultCluster)(context);
+        const picks = [];
+        if (defaultCluster.id) {
+            picks.push({
+                label: defaultCluster.name ? `Use default: ${defaultCluster.name}` : 'Use default cluster',
+                description: defaultCluster.id,
+                detail: 'databricksTools.defaultClusterId',
+            });
+        }
+        picks.push({ label: 'Choose different cluster…', description: 'Select from cluster list' });
+        const clusterPick = await vscode.window.showQuickPick(picks, {
+            title: 'Select cluster for definition',
+            ignoreFocusOut: true,
+        });
+        if (!clusterPick) {
+            return;
+        }
+        let clusterId = defaultCluster.id;
+        if (clusterPick.description !== defaultCluster.id) {
+            let clusters = [];
+            try {
+                clusters = await client.listClusters(cts.token);
+            }
+            catch (err) {
+                const message = formatDatabricksError(err, 'cluster list');
+                void vscode.window.showErrorMessage(message);
+                return;
+            }
+            if (!clusters.length) {
+                void vscode.window.showInformationMessage('No clusters found. Set a default cluster and try again.');
+                return;
+            }
+            const items = clusters.slice(0, 200).map(c => ({
+                label: c.cluster_name ?? c.cluster_id ?? 'Cluster',
+                description: c.cluster_id ?? '',
+                detail: `state=${c.state ?? 'n/a'}, source=${c.cluster_source ?? 'n/a'}, runtime=${c.spark_version ?? 'n/a'}`,
+            }));
+            const pick = await vscode.window.showQuickPick(items, {
+                title: 'Choose cluster',
+                placeHolder: 'Pick a Databricks cluster',
+                ignoreFocusOut: true,
+            });
+            clusterId = pick?.description ?? defaultCluster.id;
+        }
+        if (!clusterId) {
+            void vscode.window.showErrorMessage('No cluster selected. Set a default cluster and try again.');
+            return;
+        }
+        const markdown = await getClusterDefinitionMarkdown(context, { clusterId, includeRawJson: includeRawPick.value }, cts.token);
+        const output = (0, databricksClient_1.getOutputChannel)();
+        output.appendLine('');
+        output.appendLine(markdown);
+        output.show(true);
+    }
+    catch (err) {
+        const message = formatDatabricksError(err, 'cluster definition');
+        void vscode.window.showErrorMessage(message);
+    }
+    finally {
+        cts.dispose();
+    }
 }
 async function ensureClusterReady(client, clusterId, options) {
     let initialState;
@@ -1584,6 +1961,133 @@ function parseOptionalPositiveInt(value) {
     }
     return Math.floor(parsed);
 }
+async function promptTableStatsInput(context, token) {
+    const targetMode = await vscode.window.showQuickPick([
+        { label: 'Unity Catalog table', description: 'catalog.schema.table', value: 'table' },
+        { label: 'Delta/Volume path', description: 'dbfs:/... or /Volumes/...', value: 'path' },
+    ], { title: 'Profile target', ignoreFocusOut: true });
+    if (!targetMode) {
+        return undefined;
+    }
+    let tableName;
+    let path;
+    if (targetMode.value === 'table') {
+        const input = await vscode.window.showInputBox({
+            title: 'Table name',
+            prompt: 'Enter full table name, e.g., catalog.schema.table',
+            ignoreFocusOut: true,
+            validateInput: value => (value.trim() ? null : 'Table name is required'),
+        });
+        if (!input) {
+            return undefined;
+        }
+        tableName = input.trim();
+    }
+    else {
+        const input = await vscode.window.showInputBox({
+            title: 'Table path',
+            prompt: 'Enter table/storage path, e.g., dbfs:/..., abfss:/..., or /Volumes/...',
+            ignoreFocusOut: true,
+            validateInput: value => (value.trim() ? null : 'Table path is required'),
+        });
+        if (!input) {
+            return undefined;
+        }
+        path = input.trim();
+    }
+    const maxColumnsInput = await vscode.window.showInputBox({
+        title: 'Max columns (optional)',
+        prompt: 'Maximum columns to profile (default 50)',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return null;
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Enter a non-negative integer or leave empty';
+        },
+    });
+    const maxColumns = maxColumnsInput && maxColumnsInput.trim() ? Number(maxColumnsInput.trim()) : undefined;
+    const clusterModePick = await vscode.window.showQuickPick([
+        { label: 'Use default cluster (recommended)', value: 'defaultCluster' },
+        { label: 'Pick an existing cluster', value: 'existingCluster' },
+        { label: 'Create new job cluster', value: 'newJobCluster' },
+    ], { title: 'Choose cluster', ignoreFocusOut: true });
+    if (!clusterModePick) {
+        return undefined;
+    }
+    if (clusterModePick.value === 'defaultCluster') {
+        return { tableName, path, clusterMode: 'defaultCluster', maxColumns };
+    }
+    if (clusterModePick.value === 'existingCluster') {
+        const ctsPick = new vscode.CancellationTokenSource();
+        try {
+            const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+            const picked = await pickClusterFromList(client, ctsPick.token, {
+                title: 'Select existing cluster for profiling',
+                placeHolder: 'Cluster to run profiling job',
+            });
+            if (!picked?.id) {
+                return undefined;
+            }
+            return { tableName, path, clusterMode: 'existingCluster', existingClusterId: picked.id, maxColumns };
+        }
+        finally {
+            ctsPick.dispose();
+        }
+    }
+    const sparkVersion = await vscode.window.showInputBox({
+        title: 'Runtime version',
+        prompt: 'Enter Databricks runtime version, e.g. 14.3.x-scala2.12',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Runtime version is required'),
+    });
+    if (!sparkVersion) {
+        return undefined;
+    }
+    const nodeTypeId = await vscode.window.showInputBox({
+        title: 'Node type',
+        prompt: 'Enter node_type_id for workers/driver',
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Node type is required'),
+    });
+    if (!nodeTypeId) {
+        return undefined;
+    }
+    const numWorkersInput = await vscode.window.showInputBox({
+        title: 'Number of workers (optional)',
+        prompt: 'Enter worker count (default 1)',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return null;
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Enter a non-negative integer or leave empty';
+        },
+    });
+    const autoTermInput = await vscode.window.showInputBox({
+        title: 'Auto-termination minutes (optional)',
+        prompt: 'Enter auto-termination in minutes (default 60)',
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value.trim()) {
+                return null;
+            }
+            return /^\d+$/.test(value.trim()) ? null : 'Enter a non-negative integer or leave empty';
+        },
+    });
+    return {
+        tableName,
+        path,
+        clusterMode: 'newJobCluster',
+        newClusterConfig: {
+            sparkVersion: sparkVersion.trim(),
+            nodeTypeId: nodeTypeId.trim(),
+            numWorkers: parseOptionalPositiveInt(numWorkersInput),
+            autoTerminationMinutes: parseOptionalPositiveInt(autoTermInput),
+        },
+        maxColumns,
+    };
+}
 async function createAndRunJobFromCode(context, input, token) {
     const jobName = input.jobName?.trim();
     const sourceCode = input.sourceCode;
@@ -1851,6 +2355,89 @@ const TABLE_PROFILE_NOTEBOOK_SOURCE = [
     'except Exception as e:',
     '    dbutils.notebook.exit(json.dumps({"error": str(e)}))',
 ].join('\n');
+const TABLE_STATS_NOTEBOOK_SOURCE = [
+    '# Databricks table stats profiler',
+    'import json',
+    'from pyspark.sql import functions as F',
+    'from pyspark.sql import types as T',
+    '',
+    'table_name = dbutils.widgets.get("tableName") or ""',
+    'table_path = dbutils.widgets.get("path") or ""',
+    'max_cols_raw = dbutils.widgets.get("maxColumns") or "50"',
+    'max_cols = int(max_cols_raw) if max_cols_raw else 50',
+    '',
+    'def quote_identifier(name: str) -> str:',
+    '    parts = [p for p in name.split(".") if p]',
+    "    return '.'.join(['`' + p.replace('`', '``') + '`' for p in parts])",
+    '',
+    'def load_df():',
+    '    if table_name:',
+    '        return spark.table(table_name)',
+    '    if table_path:',
+    '        return spark.read.format("delta").load(table_path)',
+    '    raise ValueError("tableName or path is required")',
+    '',
+    'def describe_detail():',
+    '    if table_name:',
+    '        target = f"DESCRIBE DETAIL {quote_identifier(table_name)}"',
+    '    else:',
+    "        safe_path = table_path.replace('`', '``')",
+    '        target = f"DESCRIBE DETAIL delta.`{safe_path}`"',
+    '    return spark.sql(target).first().asDict()',
+    '',
+    'def is_numeric(dt):',
+    '    return isinstance(dt, (T.ByteType, T.ShortType, T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.DecimalType))',
+    '',
+    'def is_date_like(dt):',
+    '    return isinstance(dt, (T.DateType, T.TimestampType))',
+    '',
+    'result = {}',
+    'try:',
+    '    detail = describe_detail()',
+    '    df = load_df()',
+    '    total_cols = len(df.schema)',
+    '    cols = df.schema[:max_cols]',
+    '    total_rows = detail.get("numRows")',
+    '    try:',
+    '        total_rows = int(total_rows) if total_rows is not None else None',
+    '    except Exception:',
+    '        total_rows = None',
+    '    if total_rows is None:',
+    '        total_rows = df.count()',
+    '',
+    '    col_stats = []',
+    '    for field in cols:',
+    '        col = F.col(field.name)',
+    '        agg = df.agg(',
+    '            F.count(F.when(col.isNotNull(), 1)).alias("nonNull"),',
+    '            F.approx_count_distinct(col).alias("approxDistinct"),',
+    '            F.min(col).alias("min"),',
+    '            F.max(col).alias("max")',
+    '        ).first().asDict()',
+    '        non_null = agg.get("nonNull") or 0',
+    '        nulls = total_rows - non_null if total_rows is not None else None',
+    '        null_pct = (nulls / total_rows * 100) if (total_rows and nulls is not None) else None',
+    '        approx_distinct = agg.get("approxDistinct")',
+    '        min_v = agg.get("min") if (is_numeric(field.dataType) or is_date_like(field.dataType)) else None',
+    '        max_v = agg.get("max") if (is_numeric(field.dataType) or is_date_like(field.dataType)) else None',
+    '        col_stats.append({',
+    '            "name": field.name,',
+    '            "type": str(field.dataType),',
+    '            "nullPercent": null_pct,',
+    '            "approxDistinct": approx_distinct,',
+    '            "min": min_v,',
+    '            "max": max_v,',
+    '            "isPartition": field.name in (detail.get("partitionColumns") or []),',
+    '        })',
+    '',
+    '    result["detail"] = detail',
+    '    result["columns"] = col_stats',
+    '    result["totalColumns"] = total_cols',
+    '    result["maxColumns"] = max_cols',
+    '    dbutils.notebook.exit(json.dumps(result, default=str))',
+    'except Exception as e:',
+    '    dbutils.notebook.exit(json.dumps({"error": str(e)}))',
+].join('\n');
 async function analyzeRunPerformance(client, runId, includeRawJson, token) {
     const run = await client.getRunDetails(runId, token);
     let cluster;
@@ -1864,6 +2451,42 @@ async function analyzeRunPerformance(client, runId, includeRawJson, token) {
         }
     }
     return formatRunPerformance(run, cluster, includeRawJson);
+}
+async function analyzeRunStages(context, input, token) {
+    const runId = input.runId;
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const run = await client.getRunDetails(runId, token);
+    const output = await client.getRunOutput(runId, token).catch(() => undefined);
+    const clusterId = run.cluster_instance?.cluster_id;
+    const runPageUrl = run.run_page_url;
+    const appId = output?.metadata?.applicationId || run.cluster_instance?.spark_context_id;
+    return formatRunStages(runId, {
+        run,
+        clusterId,
+        runPageUrl,
+        appId,
+        logs: output?.logs,
+    });
+}
+async function explainSql(context, input, token) {
+    const sql = input.sql?.trim();
+    if (!sql) {
+        throw new Error('SQL statement is required to explain.');
+    }
+    const wrapped = `EXPLAIN FORMATTED ${sql}`;
+    return executeSqlOnCluster(context, {
+        sql: wrapped,
+        clusterId: input.clusterId,
+        maxRows: 200,
+        timeoutSeconds: 120,
+    }, token);
+}
+async function summarizeJobHistory(context, input, token) {
+    const jobId = input.jobId;
+    const limit = normalizeOptionalInt(typeof input.limit === 'number' ? input.limit : undefined, 20);
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const runs = await client.listRuns(jobId, limit, token ?? new vscode.CancellationTokenSource().token);
+    return formatJobHistory(jobId, runs, limit);
 }
 async function profileTableLayout(context, input, token) {
     const tableName = input.tableName?.trim();
@@ -1910,6 +2533,112 @@ async function profileTableLayout(context, input, token) {
         history: parsed.history,
         error: parsed.error,
     });
+}
+async function profileTableStats(context, input, token) {
+    const tableName = input.tableName?.trim();
+    const path = input.path?.trim();
+    if (!tableName && !path) {
+        throw new Error('Provide tableName or path to profile table stats.');
+    }
+    const maxColumns = normalizeOptionalInt(typeof input.maxColumns === 'number' ? input.maxColumns : undefined, 50);
+    const requestedClusterMode = input.clusterMode ?? 'defaultCluster';
+    const effectiveToken = token ?? new vscode.CancellationTokenSource().token;
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    let clusterTarget;
+    let clusterInfo = {};
+    if (requestedClusterMode === 'newJobCluster') {
+        const cfg = input.newClusterConfig;
+        if (!cfg || !cfg.sparkVersion || !cfg.nodeTypeId) {
+            throw new Error('newClusterConfig.sparkVersion and nodeTypeId are required when clusterMode is newJobCluster.');
+        }
+        const normalizedConfig = {
+            sparkVersion: cfg.sparkVersion,
+            nodeTypeId: cfg.nodeTypeId,
+            numWorkers: normalizeOptionalInt(cfg.numWorkers, 1),
+            autoTerminationMinutes: normalizeOptionalInt(cfg.autoTerminationMinutes, 60),
+        };
+        clusterTarget = { type: 'new', config: normalizedConfig };
+        clusterInfo = {
+            clusterId: 'job-cluster',
+            clusterName: 'new job cluster',
+            clusterSource: 'JOB',
+            autoStarted: true,
+        };
+    }
+    else {
+        const resolved = await resolveClusterForExecution(context, client, requestedClusterMode, input.existingClusterId, effectiveToken);
+        clusterTarget = { type: 'existing', id: resolved.clusterId };
+        clusterInfo = {
+            clusterId: resolved.clusterId,
+            clusterName: resolved.clusterName,
+            clusterSource: resolved.clusterSource,
+            initialState: resolved.initialState,
+            finalState: resolved.finalState,
+            autoStarted: resolved.autoStarted,
+        };
+    }
+    const uploadSettings = (0, databricksClient_1.getWorkspaceUploadSettings)();
+    const projectName = vscode.workspace.workspaceFolders?.[0]?.name;
+    const notebookPath = (0, workspacePath_1.computeUploadWorkspacePath)({
+        jobName: 'table-stats-profile',
+        language: 'PYTHON',
+        defaultWorkspaceFolder: uploadSettings.folder,
+        appendProjectSubfolder: uploadSettings.appendProjectSubfolder,
+        projectName,
+    });
+    await client.importWorkspaceSource(notebookPath, 'PYTHON', TABLE_STATS_NOTEBOOK_SOURCE);
+    const baseParameters = {
+        tableName: tableName ?? '',
+        path: path ?? '',
+        maxColumns: maxColumns.toString(),
+    };
+    const runName = tableName ? `Table stats: ${tableName}` : `Table stats: ${path}`;
+    const { runId } = await client.submitSingleTaskRun({
+        runName,
+        notebookPath,
+        cluster: clusterTarget,
+        baseParameters,
+    }, effectiveToken);
+    const runDetails = await waitForRunCompletion(client, runId, effectiveToken, {
+        pollIntervalMs: 5000,
+        timeoutMs: 15 * 60 * 1000,
+    });
+    const output = await client.getRunOutput(runId, effectiveToken);
+    const parsed = parseTableStatsOutput(output.notebook_output?.result);
+    const clusterIdFromRun = runDetails.cluster_instance?.cluster_id;
+    const clusterId = clusterIdFromRun || clusterInfo.clusterId || 'unknown';
+    return formatTableStatsProfile({
+        targetLabel: tableName ?? path ?? 'table',
+        runId,
+        notebookPath,
+        cluster: {
+            clusterId,
+            clusterName: clusterInfo.clusterName,
+            clusterSource: clusterInfo.clusterSource,
+            initialState: clusterInfo.initialState,
+            finalState: clusterInfo.finalState,
+            autoStarted: clusterInfo.autoStarted,
+        },
+        runState: runDetails.state?.life_cycle_state,
+        resultState: runDetails.state?.result_state,
+        detail: parsed.detail,
+        columns: parsed.columns,
+        totalColumns: parsed.totalColumns,
+        maxColumns: parsed.maxColumns,
+        error: parsed.error,
+    });
+}
+function parseTableStatsOutput(result) {
+    if (!result) {
+        return {};
+    }
+    try {
+        const parsed = JSON.parse(result);
+        return parsed;
+    }
+    catch {
+        return { error: 'Profiling job returned output that could not be parsed as JSON.' };
+    }
 }
 function parseTableProfileOutput(result) {
     if (!result) {
@@ -1988,6 +2717,31 @@ function formatRunPerformance(run, cluster, includeRawJson) {
     }
     return lines.join('\n');
 }
+function formatRunStages(runId, args) {
+    const lines = [];
+    lines.push(`# Run stage analysis`);
+    lines.push(`- run_id: ${runId}`);
+    lines.push(`- state: ${args.run.state?.life_cycle_state ?? 'unknown'} / ${args.run.state?.result_state ?? 'unknown'}`);
+    const clusterId = args.clusterId ?? 'unknown';
+    lines.push(`- cluster: ${clusterId}`);
+    if (args.appId) {
+        lines.push(`- spark_app_id: ${args.appId}`);
+    }
+    if (args.runPageUrl) {
+        lines.push(`- spark_ui: ${args.runPageUrl}`);
+    }
+    lines.push('');
+    lines.push('Stage-level metrics are not exposed via the Jobs API. Open the Spark UI link above to inspect stages, tasks, and shuffle details.');
+    if (args.logs?.length) {
+        lines.push('');
+        lines.push('## Recent driver logs (truncated)');
+        const tail = args.logs.slice(-50);
+        lines.push('```');
+        lines.push(tail.join('\n'));
+        lines.push('```');
+    }
+    return lines.join('\n');
+}
 function formatTableLayoutProfile(args) {
     const lines = [];
     lines.push(`# Table layout profile`);
@@ -2043,6 +2797,104 @@ function formatTableLayoutProfile(args) {
             const metricsStr = metrics ? JSON.stringify(metrics) : 'n/a';
             lines.push(`| ${ts} | ${op} | ${user} | ${readVersion} | ${metricsStr} |`);
         }
+    }
+    return lines.join('\n');
+}
+function formatTableStatsProfile(args) {
+    const lines = [];
+    lines.push('# Table stats profile');
+    lines.push(`- target: ${args.targetLabel}`);
+    lines.push(`- run_id: ${args.runId}`);
+    lines.push(`- run_state: ${args.runState ?? 'unknown'} / ${args.resultState ?? 'unknown'}`);
+    const clusterLabel = args.cluster.clusterName ?? args.cluster.clusterId ?? 'unknown';
+    const autoStartNote = args.cluster.autoStarted ? ` (auto-started from ${args.cluster.initialState ?? 'unknown'})` : '';
+    const clusterSource = args.cluster.clusterSource ? ` [${args.cluster.clusterSource}]` : '';
+    lines.push(`- cluster: ${clusterLabel} (${args.cluster.clusterId})${clusterSource}${autoStartNote}`);
+    lines.push(`- notebook path: \`${args.notebookPath}\``);
+    if (args.error) {
+        lines.push('');
+        lines.push(`Profiling failed: ${args.error}`);
+        return lines.join('\n');
+    }
+    if (args.detail) {
+        const numRows = args.detail['numRows'] != null ? String(args.detail['numRows']) : 'n/a';
+        const numFiles = args.detail['numFiles'] != null ? String(args.detail['numFiles']) : 'n/a';
+        const sizeBytes = typeof args.detail['sizeInBytes'] === 'number' ? args.detail['sizeInBytes'] : undefined;
+        const partitions = Array.isArray(args.detail['partitionColumns'])
+            ? args.detail['partitionColumns'].map(v => String(v)).join(', ')
+            : 'n/a';
+        const location = args.detail['location'] ? String(args.detail['location']) : 'n/a';
+        lines.push('');
+        lines.push('## Table');
+        lines.push(`- format: ${String(args.detail['format'] ?? 'n/a')}`);
+        lines.push(`- rows: ${numRows}`);
+        lines.push(`- files: ${numFiles}`);
+        lines.push(`- size: ${sizeBytes != null ? formatSizeBytes(sizeBytes) : 'n/a'}`);
+        lines.push(`- partitions: ${partitions}`);
+        lines.push(`- location: ${location}`);
+    }
+    const cols = args.columns ?? [];
+    if (cols.length) {
+        lines.push('');
+        const maxNote = args.maxColumns && args.totalColumns && args.totalColumns > args.maxColumns
+            ? ` (showing first ${args.maxColumns} of ${args.totalColumns})`
+            : '';
+        lines.push(`## Columns${maxNote}`);
+        lines.push('| column | type | null% | approx distinct | min | max | partition |');
+        lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+        for (const col of cols) {
+            const name = String(col['name'] ?? 'n/a');
+            const type = String(col['type'] ?? 'n/a');
+            const nullPct = typeof col['nullPercent'] === 'number' ? `${col['nullPercent'].toFixed(2)}%` : 'n/a';
+            const approxDistinct = col['approxDistinct'] != null ? String(col['approxDistinct']) : 'n/a';
+            const minVal = col['min'] != null ? String(col['min']) : 'n/a';
+            const maxVal = col['max'] != null ? String(col['max']) : 'n/a';
+            const isPartition = col['isPartition'] ? 'yes' : 'no';
+            lines.push(`| ${name} | ${type} | ${nullPct} | ${approxDistinct} | ${minVal} | ${maxVal} | ${isPartition} |`);
+        }
+    }
+    if (!cols.length) {
+        lines.push('');
+        lines.push('No column stats were returned. Check table access and retry.');
+    }
+    return lines.join('\n');
+}
+function formatJobHistory(jobId, runs, limit) {
+    if (!runs.length) {
+        return `No runs found for job ${jobId}.`;
+    }
+    let success = 0;
+    let failed = 0;
+    const durations = [];
+    for (const run of runs) {
+        const result = (run.state?.result_state ?? '').toUpperCase();
+        if (result === 'SUCCESS') {
+            success += 1;
+        }
+        else if (result) {
+            failed += 1;
+        }
+        if (run.start_time && run.end_time) {
+            durations.push(run.end_time - run.start_time);
+        }
+    }
+    const avgMs = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : undefined;
+    const minMs = durations.length ? Math.min(...durations) : undefined;
+    const maxMs = durations.length ? Math.max(...durations) : undefined;
+    const lines = [];
+    lines.push(`# Job history for job ${jobId}`);
+    lines.push(`- runs analyzed: ${runs.length} (limit ${limit})`);
+    lines.push(`- success: ${success}, failed/other: ${failed}`);
+    lines.push(`- success rate: ${runs.length ? ((success / runs.length) * 100).toFixed(1) + '%' : 'n/a'}`);
+    lines.push(`- duration ms (min/avg/max): ${minMs != null ? minMs.toFixed(0) : 'n/a'} / ${avgMs != null ? avgMs.toFixed(0) : 'n/a'} / ${maxMs != null ? maxMs.toFixed(0) : 'n/a'}`);
+    lines.push('');
+    lines.push('## Recent runs');
+    lines.push('| run_id | state | result | duration_ms | started |');
+    lines.push('| --- | --- | --- | --- | --- |');
+    for (const run of runs.slice(0, limit)) {
+        const duration = run.start_time && run.end_time ? (run.end_time - run.start_time).toFixed(0) : 'n/a';
+        const started = run.start_time ? new Date(run.start_time).toISOString() : 'n/a';
+        lines.push(`| ${run.run_id} | ${run.state?.life_cycle_state ?? 'n/a'} | ${run.state?.result_state ?? 'n/a'} | ${duration} | ${started} |`);
     }
     return lines.join('\n');
 }
@@ -2509,6 +3361,141 @@ function formatRunDetails(run, includeRawJson) {
     }
     return lines.join('\n');
 }
+const PERFORMANCE_SPARK_CONF_KEYS = [
+    'spark.databricks.delta.optimizeWrite',
+    'spark.databricks.delta.autoCompact',
+    'spark.sql.shuffle.partitions',
+    'spark.sql.adaptive.enabled',
+    'spark.sql.adaptive.shuffle.targetPostShuffleInputSize',
+    'spark.executor.memory',
+    'spark.executor.memoryOverhead',
+    'spark.executor.cores',
+    'spark.driver.memory',
+    'spark.driver.cores',
+    'spark.databricks.io.cache.enabled',
+];
+function redactMap(input) {
+    const values = {};
+    const redactedKeys = [];
+    const shownKeys = [];
+    if (!input) {
+        return { values, redactedKeys, shownKeys };
+    }
+    for (const [k, v] of Object.entries(input)) {
+        const lower = k.toLowerCase();
+        const strVal = typeof v === 'string' ? v : v === undefined || v === null ? '' : String(v);
+        const looksSecret = /token|secret|password|key|credential|bearer/i.test(lower) || /token|secret|password|bearer/i.test(strVal);
+        if (looksSecret || strVal.length > 80) {
+            values[k] = '***redacted***';
+            redactedKeys.push(k);
+        }
+        else {
+            values[k] = strVal;
+            shownKeys.push(k);
+        }
+    }
+    return { values, redactedKeys, shownKeys };
+}
+function formatSelectedMap(title, entries, keys) {
+    const lines = [];
+    const present = keys.filter(k => entries[k] !== undefined);
+    if (present.length === 0) {
+        lines.push(`${title}: none found`);
+        return lines;
+    }
+    lines.push(title + ':');
+    for (const key of present) {
+        lines.push(`- \`${key}\`: ${entries[key]}`);
+    }
+    return lines;
+}
+function summarizeAutoscale(cluster) {
+    if (cluster.autoscale) {
+        const min = cluster.autoscale.min_workers ?? '?';
+        const max = cluster.autoscale.max_workers ?? '?';
+        return `Autoscaling: enabled, min workers = ${min}, max workers = ${max}`;
+    }
+    if (cluster.num_workers != null) {
+        return `Workers: ${cluster.num_workers}`;
+    }
+    return 'Workers: n/a';
+}
+function formatClusterDefinitionMarkdown(cluster, options) {
+    const lines = [];
+    const autoTermination = cluster.autotermination_minutes != null ? `${cluster.autotermination_minutes} minutes` : 'not configured';
+    lines.push('## Cluster Definition');
+    lines.push('');
+    lines.push(`Cluster ID: \`${cluster.cluster_id ?? 'n/a'}\`  `);
+    lines.push(`Name: \`${cluster.cluster_name ?? 'n/a'}\`  `);
+    lines.push(`State: \`${cluster.state ?? 'n/a'}\`  `);
+    lines.push(`Source: \`${cluster.cluster_source ?? 'unknown'}\`  ${options.usedDefaultCluster ? '(default cluster)' : ''}`);
+    lines.push(`Resolved from: ${options.clusterIdSource}`);
+    lines.push('');
+    lines.push('### Runtime & Node Types');
+    lines.push(`- Runtime: \`${cluster.spark_version ?? 'n/a'}\``);
+    lines.push(`- Driver node type: \`${cluster.driver_node_type_id ?? cluster.node_type_id ?? 'n/a'}\``);
+    lines.push(`- Worker node type: \`${cluster.node_type_id ?? cluster.driver_node_type_id ?? 'n/a'}\``);
+    lines.push(`- ${summarizeAutoscale(cluster)}`);
+    if (cluster.instance_pool_id) {
+        lines.push(`- Instance pool: \`${cluster.instance_pool_id}\``);
+    }
+    lines.push('');
+    lines.push('### Auto-Termination');
+    lines.push(`- Auto-termination: ${autoTermination}`);
+    lines.push('');
+    const sparkLines = formatSelectedMap('### Spark Config (selected)', options.redactedSparkConf.values, PERFORMANCE_SPARK_CONF_KEYS);
+    lines.push(...sparkLines);
+    const redactedSparkCount = options.redactedSparkConf.redactedKeys.length;
+    const otherSparkKeys = Object.keys(options.redactedSparkConf.values).filter(k => !PERFORMANCE_SPARK_CONF_KEYS.includes(k));
+    if (otherSparkKeys.length || redactedSparkCount) {
+        lines.push(`- Other spark_conf keys present${redactedSparkCount ? ` (${redactedSparkCount} redacted)` : ''}.`);
+    }
+    lines.push('');
+    const envLines = formatSelectedMap('### Environment Variables (selected, non-secret)', options.redactedEnv.values, Object.keys(options.redactedEnv.values));
+    lines.push(...envLines);
+    if (options.redactedEnv.redactedKeys.length) {
+        lines.push(`- ${options.redactedEnv.redactedKeys.length} env var(s) redacted.`);
+    }
+    if (options.includeRawJson) {
+        lines.push('');
+        lines.push('<details>');
+        lines.push('<summary>Raw cluster JSON (redacted)</summary>');
+        lines.push('');
+        lines.push('```json');
+        lines.push(JSON.stringify(cluster, null, 2));
+        lines.push('```');
+        lines.push('</details>');
+    }
+    return lines.join('\n');
+}
+async function getClusterDefinitionMarkdown(context, input, token) {
+    const includeRawJson = input.includeRawJson ?? false;
+    const requestedCluster = (input.clusterId ?? '').trim();
+    const defaultCluster = await (0, databricksClient_1.getDefaultCluster)(context);
+    const clusterId = requestedCluster || defaultCluster.id;
+    if (!clusterId) {
+        return 'No cluster selected. Set a default cluster via **Databricks Tools: Select Default Cluster** and try again.';
+    }
+    const clusterIdSource = requestedCluster ? 'Explicit clusterId input' : 'databricksTools.defaultClusterId';
+    const client = await databricksClient_1.DatabricksClient.fromConfig(context);
+    const cluster = await client.getClusterDefinition(clusterId, token);
+    const redactedSparkConf = redactMap(cluster.spark_conf);
+    const redactedEnv = redactMap(cluster.environment_vars);
+    const redactedCluster = {
+        ...cluster,
+        spark_conf: redactedSparkConf.values,
+        environment_vars: redactedEnv.values,
+    };
+    const markdown = formatClusterDefinitionMarkdown(redactedCluster, {
+        includeRawJson,
+        redactedSparkConf,
+        redactedEnv,
+        usedDefaultCluster: !requestedCluster && !!defaultCluster.id,
+        defaultClusterName: defaultCluster.name,
+        clusterIdSource,
+    });
+    return markdown;
+}
 function normalizeOptionalInt(value, fallback) {
     if (value === undefined || value === null) {
         return fallback;
@@ -2529,6 +3516,130 @@ function normalizeRowLimit(value) {
     }
     const n = Math.max(1, Math.floor(value));
     return Math.min(n, 1000);
+}
+const ARTIFACT_MAPPING_FILE = 'databricks-mapping.json';
+async function resolveArtifactMapping(context, input) {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) {
+        throw new Error('Open a workspace to resolve artifact mappings.');
+    }
+    if (input.jobId == null && !input.workspacePath) {
+        throw new Error('Provide jobId or workspacePath to resolve.');
+    }
+    const { store, mappingPath, exists } = await readArtifactMappingStore(workspaceRoot);
+    const lines = [];
+    lines.push('# Artifact mapping');
+    lines.push(`- mapping file: \.vscode\\${ARTIFACT_MAPPING_FILE}${exists ? '' : ' (will be created after adding mappings)'}`);
+    if (input.jobId != null) {
+        const mapped = store.jobs?.[String(input.jobId)];
+        if (mapped) {
+            lines.push('');
+            lines.push(`Job ${input.jobId} → \\${mapped}`);
+        }
+        else {
+            lines.push('');
+            lines.push(`No mapping found for job ${input.jobId}. Use **Databricks Tools: Add Artifact Mapping** to add one.`);
+        }
+    }
+    if (input.workspacePath) {
+        const mapped = store.workspaces?.[input.workspacePath];
+        if (mapped) {
+            lines.push('');
+            lines.push(`Workspace path ${input.workspacePath} → \\${mapped}`);
+        }
+        else {
+            lines.push('');
+            lines.push(`No mapping found for workspace path ${input.workspacePath}. Use **Databricks Tools: Add Artifact Mapping** to add one.`);
+        }
+    }
+    lines.push('');
+    lines.push(`Mapping file location: \\${mappingPath}`);
+    return lines.join('\n');
+}
+async function addArtifactMapping() {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        void vscode.window.showErrorMessage('Open a workspace folder before adding an artifact mapping.');
+        return;
+    }
+    const typePick = await vscode.window.showQuickPick([
+        { label: 'Job ID → repo file', value: 'job' },
+        { label: 'Workspace path → repo file', value: 'workspace' },
+    ], { title: 'Artifact type', ignoreFocusOut: true });
+    if (!typePick) {
+        return;
+    }
+    let jobId;
+    let workspacePathInput;
+    if (typePick.value === 'job') {
+        const jobInput = await vscode.window.showInputBox({
+            title: 'Job ID',
+            prompt: 'Enter Databricks job ID',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                if (!value.trim())
+                    return 'Job ID is required';
+                return /^\d+$/.test(value.trim()) ? null : 'Enter a numeric job ID';
+            },
+        });
+        if (!jobInput)
+            return;
+        jobId = Number(jobInput.trim());
+    }
+    else {
+        const wsInput = await vscode.window.showInputBox({
+            title: 'Workspace notebook path',
+            prompt: 'Enter workspace path, e.g. /Workspace/Users/...',
+            ignoreFocusOut: true,
+            validateInput: value => (value.trim() ? null : 'Workspace path is required'),
+        });
+        if (!wsInput)
+            return;
+        workspacePathInput = wsInput.trim();
+    }
+    const defaultPath = vscode.window.activeTextEditor
+        ? vscode.workspace.asRelativePath(vscode.window.activeTextEditor.document.uri, false)
+        : undefined;
+    const repoPath = await vscode.window.showInputBox({
+        title: 'Repository file path',
+        prompt: 'Enter repo-relative file path for the artifact',
+        value: defaultPath,
+        ignoreFocusOut: true,
+        validateInput: value => (value.trim() ? null : 'Repo path is required'),
+    });
+    if (!repoPath) {
+        return;
+    }
+    const { store, mappingPath } = await readArtifactMappingStore(workspaceFolder.uri.fsPath);
+    const normalizedRepoPath = repoPath.trim();
+    if (jobId != null) {
+        store.jobs = store.jobs ?? {};
+        store.jobs[String(jobId)] = normalizedRepoPath;
+    }
+    else if (workspacePathInput) {
+        store.workspaces = store.workspaces ?? {};
+        store.workspaces[workspacePathInput] = normalizedRepoPath;
+    }
+    await writeArtifactMappingStore(mappingPath, store);
+    void vscode.window.showInformationMessage('Artifact mapping saved.');
+}
+async function readArtifactMappingStore(workspaceRoot) {
+    const mappingPath = path.join(workspaceRoot, '.vscode', ARTIFACT_MAPPING_FILE);
+    try {
+        const content = await fs_1.promises.readFile(mappingPath, 'utf8');
+        const parsed = content ? JSON.parse(content) : {};
+        return { store: parsed, mappingPath, exists: true };
+    }
+    catch (err) {
+        if (err?.code === 'ENOENT') {
+            return { store: {}, mappingPath, exists: false };
+        }
+        throw err;
+    }
+}
+async function writeArtifactMappingStore(mappingPath, store) {
+    await fs_1.promises.mkdir(path.dirname(mappingPath), { recursive: true });
+    await fs_1.promises.writeFile(mappingPath, JSON.stringify(store, null, 2), 'utf8');
 }
 function formatDatabricksError(err, context) {
     if (err instanceof databricksClient_1.ConfigCancelled) {

@@ -165,6 +165,42 @@ class DatabricksClient {
             throw new Error('clusters/get returned invalid JSON.');
         }
     }
+    async getClusterDefinition(clusterId, token) {
+        const controller = new AbortController();
+        token?.onCancellationRequested(() => controller.abort());
+        const searchParams = new URLSearchParams();
+        searchParams.set('cluster_id', clusterId);
+        const url = `${this.host}/api/2.0/clusters/get?${searchParams.toString()}`;
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+            },
+            signal: controller.signal,
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            let code;
+            let message = text || res.statusText;
+            try {
+                const parsed = text ? JSON.parse(text) : {};
+                code = parsed.error_code;
+                if (parsed.message) {
+                    message = parsed.message;
+                }
+            }
+            catch {
+                // ignore parse errors
+            }
+            throw new ApiError(`clusters/get failed ${res.status}: ${message}`, res.status, '2.0', text || message, code);
+        }
+        try {
+            return text ? JSON.parse(text) : {};
+        }
+        catch {
+            throw new Error('clusters/get returned invalid JSON.');
+        }
+    }
     async startCluster(clusterId, token) {
         const controller = new AbortController();
         token.onCancellationRequested(() => controller.abort());

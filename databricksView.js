@@ -213,6 +213,31 @@ class DatabricksViewProvider {
                 command: { command: 'databricksTools.profileTableLayout', title: 'Profile Table Layout' },
                 icon: 'database',
             }),
+            new SimpleTreeItem({
+                label: 'Profile Table Stats…',
+                command: { command: 'databricksTools.profileTableStats', title: 'Profile Table Stats' },
+                icon: 'graph',
+            }),
+            new SimpleTreeItem({
+                label: 'Show Cluster Definition…',
+                command: { command: 'databricksTools.showClusterDefinition', title: 'Show Cluster Definition' },
+                icon: 'server',
+            }),
+            new SimpleTreeItem({
+                label: 'Analyze Run Stages…',
+                command: { command: 'databricksTools.analyzeRunStages', title: 'Analyze Run Stages' },
+                icon: 'pulse',
+            }),
+            new SimpleTreeItem({
+                label: 'Explain SQL…',
+                command: { command: 'databricksTools.explainSql', title: 'Explain SQL' },
+                icon: 'book',
+            }),
+            new SimpleTreeItem({
+                label: 'Summarize Job History…',
+                command: { command: 'databricksTools.summarizeJobHistory', title: 'Summarize Job History' },
+                icon: 'history',
+            }),
         ];
         const debugItems = [
             new SimpleTreeItem({
@@ -229,6 +254,11 @@ class DatabricksViewProvider {
                 label: 'Show Logs',
                 command: { command: 'databricksTools.showLogs', title: 'Show Logs' },
                 icon: 'output',
+            }),
+            new SimpleTreeItem({
+                label: 'Add Artifact Mapping…',
+                command: { command: 'databricksTools.addArtifactMapping', title: 'Add Artifact Mapping' },
+                icon: 'link',
             }),
         ];
         return [
